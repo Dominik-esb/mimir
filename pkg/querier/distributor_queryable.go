@@ -28,14 +28,13 @@ import (
 	"github.com/grafana/mimir/pkg/storage/series"
 	"github.com/grafana/mimir/pkg/util"
 	"github.com/grafana/mimir/pkg/util/chunkinfologger"
-	"github.com/grafana/mimir/pkg/util/limiter"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 )
 
 // Distributor is the read interface to the distributor, made an interface here
 // to reduce package coupling.
 type Distributor interface {
-	QueryStream(ctx context.Context, queryMetrics *stats.QueryMetrics, from, to model.Time, matchers ...*labels.Matcher) (client.CombinedQueryStreamResponse, error)
+	QueryStream(ctx context.Context, queryMetrics *stats.QueryMetrics, from, to model.Time, projectionInclude bool, projectionLabels []string, matchers ...*labels.Matcher) (client.CombinedQueryStreamResponse, error)
 	QueryExemplars(ctx context.Context, from, to model.Time, matchers ...[]*labels.Matcher) (*client.ExemplarQueryResponse, error)
 	LabelValuesForLabelName(ctx context.Context, from, to model.Time, label model.LabelName, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, error)
 	LabelNames(ctx context.Context, from model.Time, to model.Time, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, error)
@@ -123,11 +122,20 @@ func (q *distributorQuerier) Select(ctx context.Context, _ bool, sp *storage.Sel
 		return series.LabelsToSeriesSet(ms)
 	}
 
-	return q.streamingSelect(ctx, minT, maxT, matchers)
+	var (
+		projectionInclude bool
+		projectionLabels  []string
+	)
+	if sp != nil {
+		projectionInclude = sp.ProjectionInclude
+		projectionLabels = sp.ProjectionLabels
+	}
+
+	return q.streamingSelect(ctx, minT, maxT, projectionInclude, projectionLabels, matchers)
 }
 
-func (q *distributorQuerier) streamingSelect(ctx context.Context, minT, maxT int64, matchers []*labels.Matcher) storage.SeriesSet {
-	results, err := q.distributor.QueryStream(ctx, q.queryMetrics, model.Time(minT), model.Time(maxT), matchers...)
+func (q *distributorQuerier) streamingSelect(ctx context.Context, minT, maxT int64, projectionInclude bool, projectionLabels []string, matchers []*labels.Matcher) storage.SeriesSet {
+	results, err := q.distributor.QueryStream(ctx, q.queryMetrics, model.Time(minT), model.Time(maxT), projectionInclude, projectionLabels, matchers...)
 	if err != nil {
 		return storage.ErrSeriesSet(err)
 	}
@@ -171,11 +179,7 @@ func (q *distributorQuerier) streamingSelect(ctx context.Context, minT, maxT int
 	// Store the stream readers so we can free their buffers when we're done using this Querier.
 	q.streamReaders = append(q.streamReaders, results.StreamReaders...)
 
-	memoryTracker, err := limiter.MemoryConsumptionTrackerFromContext(ctx)
-	if err != nil {
-		return storage.ErrSeriesSet(err)
-	}
-	return series.NewMemoryTrackingSeriesSet(series.NewConcreteSeriesSetFromSortedSeries(streamingSeries), memoryTracker)
+	return series.NewConcreteSeriesSetFromSortedSeries(streamingSeries)
 }
 
 func (q *distributorQuerier) LabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {

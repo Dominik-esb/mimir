@@ -29,7 +29,7 @@ func (v QueryPlanVersion) String() string {
 	return strconv.FormatUint(uint64(v), 10)
 }
 
-var MaximumSupportedQueryPlanVersion = QueryPlanV4
+var MaximumSupportedQueryPlanVersion = QueryPlanV6
 
 // IMPORTANT:
 // Do not change the value or meaning of these constants once they have been merged.
@@ -51,6 +51,12 @@ const QueryPlanV3 = QueryPlanVersion(3)
 
 // QueryPlanV4 introduces support for evaluating smoothed and anchored extended range modifiers.
 const QueryPlanV4 = QueryPlanVersion(4)
+
+// QueryPlanV5 introduces support for multi-aggregation nodes.
+const QueryPlanV5 = QueryPlanVersion(5)
+
+// QueryPlanV6 introduces support for query splitting with intermediate result caching.
+const QueryPlanV6 = QueryPlanVersion(6)
 
 type QueryPlan struct {
 	Root       Node
@@ -149,7 +155,8 @@ type Node interface {
 	// expression.
 	ExpressionPosition() (posrange.PositionRange, error)
 
-	// MinimumRequiredPlanVersion returns the minimum query plan version required to execute a plan that includes these nodes.
+	// MinimumRequiredPlanVersion returns the minimum query plan version required to execute a plan that includes this node.
+	// It does not consider the query plan version required by any of its children (for that, use planning.MinimumRequiredPlanVersion).
 	MinimumRequiredPlanVersion() QueryPlanVersion
 
 	// FIXME: implementations for many of the above methods can be generated automatically
@@ -227,6 +234,33 @@ type OperatorParameters struct {
 	Logger                   log.Logger
 }
 
+// RangeParams describes the time range parameters for range vector selectors and subqueries.
+// It includes the range duration (e.g., [5m]) and optional time modifiers (offset and @ timestamp).
+type RangeParams struct {
+	IsSet  bool
+	Range  time.Duration
+	Offset time.Duration
+	// Timestamp is a non-pointer value with HasTimestamp flag to make RangeParams
+	// suitable for use as a map key in OperatorFactoryKey.
+	HasTimestamp bool
+	Timestamp    time.Time
+}
+
+// SplitNode represents a planning node that supports range vector splitting with intermediate result caching.
+// Nodes implementing this interface can be split into sub-ranges for parallel execution and caching.
+type SplitNode interface {
+	Node
+
+	// IsSplittable returns true if the node can actually be split. While a node satisfying this interface can usually
+	// be split, there might be some edge cases where it's not possible or not implemented yet.
+	IsSplittable() bool
+
+	// SplittingCacheKey returns a cache key for this node's intermediate results.
+	SplittingCacheKey() string
+
+	GetRangeParams() RangeParams
+}
+
 // ToEncodedPlan converts this query plan to its encoded form.
 //
 // If nodes is not empty:
@@ -280,14 +314,15 @@ func (p *QueryPlan) DeterminePlanVersion() error {
 	if p.Root == nil {
 		return errors.New("query plan version can not be determined without a root node")
 	}
-	p.Version = p.maxMinimumRequiredPlanVersion(p.Root)
+	p.Version = MinimumRequiredPlanVersion(p.Root)
 	return nil
 }
 
-func (p *QueryPlan) maxMinimumRequiredPlanVersion(node Node) QueryPlanVersion {
+// MinimumRequiredPlanVersion returns the minimum required query plan version of node and all its children.
+func MinimumRequiredPlanVersion(node Node) QueryPlanVersion {
 	maxVersion := node.MinimumRequiredPlanVersion()
 	for child := range ChildrenIter(node) {
-		maxVersion = max(maxVersion, p.maxMinimumRequiredPlanVersion(child))
+		maxVersion = max(maxVersion, MinimumRequiredPlanVersion(child))
 	}
 	return maxVersion
 }

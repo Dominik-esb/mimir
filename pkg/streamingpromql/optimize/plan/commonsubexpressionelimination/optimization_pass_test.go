@@ -11,23 +11,20 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/mimir/pkg/streamingpromql"
+	"github.com/grafana/mimir/pkg/streamingpromql/operators/functions"
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/ast"
 	_ "github.com/grafana/mimir/pkg/streamingpromql/optimize/ast/sharding" // Imported for side effects: registering the __sharded_concat__ function with the parser.
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan"
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan/commonsubexpressionelimination"
+	"github.com/grafana/mimir/pkg/streamingpromql/planning/core"
 	"github.com/grafana/mimir/pkg/streamingpromql/testutils"
 	"github.com/grafana/mimir/pkg/streamingpromql/types"
 )
 
 func TestOptimizationPass(t *testing.T) {
-	enableExtendedRangeSelectors := parser.EnableExtendedRangeSelectors
-	defer func() { parser.EnableExtendedRangeSelectors = enableExtendedRangeSelectors }()
-	parser.EnableExtendedRangeSelectors = true
-
 	testCases := map[string]struct {
 		expr                        string
 		rangeQuery                  bool
@@ -650,7 +647,40 @@ func TestOptimizationPass(t *testing.T) {
 							- MatrixSelector: {__name__="foo"}[5m0s] smoothed
 					- RHS: DeduplicateAndMerge
 						- FunctionCall: rate(...)
-							- MatrixSelector: {__name__="foo"}[5m0s] smoothed
+							- MatrixSelector: {__name__="foo"}[5m0s] smoothed counter aware
+			`,
+			expectedDuplicateNodes:      0,
+			expectedSelectorsEliminated: 0,
+			expectedSelectorsInspected:  2,
+		},
+		// These tests verify that CSE optimization correctly skips the 2nd argument to info function,
+		// allowing only the 1st argument to be deduplicated.
+		"info function with arguments included separately": {
+			expr: `foo + {k8s_cluster_name="cluster1"} + info(foo, {k8s_cluster_name="cluster1"})`,
+			expectedPlan: `
+				- BinaryExpression: LHS + RHS
+					- LHS: BinaryExpression: LHS + RHS
+						- LHS: ref#1 Duplicate
+							- VectorSelector: {__name__="foo"}
+						- RHS: VectorSelector: {k8s_cluster_name="cluster1"}
+					- RHS: FunctionCall: info(...)
+						- param 0: ref#1 Duplicate ...
+						- param 1: VectorSelector: {k8s_cluster_name="cluster1"}, return sample timestamps preserving histograms
+			`,
+			expectedDuplicateNodes:      1,
+			expectedSelectorsEliminated: 1,
+			expectedSelectorsInspected:  3,
+		},
+		"info function called twice with same 2nd argument but different 1st arguments": {
+			expr: `info(foo, {k8s_cluster_name="cluster1"}) + info(bar, {k8s_cluster_name="cluster1"})`,
+			expectedPlan: `
+				- BinaryExpression: LHS + RHS
+					- LHS: FunctionCall: info(...)
+						- param 0: VectorSelector: {__name__="foo"}
+						- param 1: VectorSelector: {k8s_cluster_name="cluster1"}, return sample timestamps preserving histograms
+					- RHS: FunctionCall: info(...)
+						- param 0: VectorSelector: {__name__="bar"}
+						- param 1: VectorSelector: {k8s_cluster_name="cluster1"}, return sample timestamps preserving histograms
 			`,
 			expectedDuplicateNodes:      0,
 			expectedSelectorsEliminated: 0,
@@ -672,7 +702,7 @@ func TestOptimizationPass(t *testing.T) {
 			plannerWithOptimizationPass, err := streamingpromql.NewQueryPlannerWithoutOptimizationPasses(opts2, streamingpromql.NewMaximumSupportedVersionQueryPlanVersionProvider())
 			require.NoError(t, err)
 			plannerWithOptimizationPass.RegisterASTOptimizationPass(&ast.CollapseConstants{})
-			plannerWithOptimizationPass.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(true, opts2.CommonOpts.Reg, opts2.Logger))
+			plannerWithOptimizationPass.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(opts2.CommonOpts.Reg, opts2.Logger))
 
 			var timeRange types.QueryTimeRange
 
@@ -683,12 +713,12 @@ func TestOptimizationPass(t *testing.T) {
 			}
 
 			if testCase.expectUnchanged {
-				p, err := plannerWithoutOptimizationPass.NewQueryPlan(ctx, testCase.expr, timeRange, observer)
+				p, err := plannerWithoutOptimizationPass.NewQueryPlan(ctx, testCase.expr, timeRange, false, observer)
 				require.NoError(t, err)
 				testCase.expectedPlan = p.String()
 			}
 
-			p, err := plannerWithOptimizationPass.NewQueryPlan(ctx, testCase.expr, timeRange, observer)
+			p, err := plannerWithOptimizationPass.NewQueryPlan(ctx, testCase.expr, timeRange, false, observer)
 			require.NoError(t, err)
 			actual := p.String()
 			require.Equal(t, testutils.TrimIndent(testCase.expectedPlan), actual)
@@ -879,12 +909,12 @@ func TestOptimizationPass_HintsHandling(t *testing.T) {
 	planner, err := streamingpromql.NewQueryPlannerWithoutOptimizationPasses(opts, streamingpromql.NewMaximumSupportedVersionQueryPlanVersionProvider())
 	require.NoError(t, err)
 	planner.RegisterQueryPlanOptimizationPass(plan.NewSkipHistogramDecodingOptimizationPass())
-	planner.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(true, nil, opts.Logger))
+	planner.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(nil, opts.Logger))
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 
-			p, err := planner.NewQueryPlan(ctx, testCase.expr, timeRange, observer)
+			p, err := planner.NewQueryPlan(ctx, testCase.expr, timeRange, false, observer)
 			require.NoError(t, err)
 			actual := p.String()
 			require.Equal(t, testutils.TrimIndent(testCase.expectedPlan), actual)
@@ -942,14 +972,14 @@ func BenchmarkOptimizationPass(b *testing.B) {
 	reg := prometheus.NewPedanticRegistry()
 	planner, err := streamingpromql.NewQueryPlannerWithoutOptimizationPasses(opts, streamingpromql.NewMaximumSupportedVersionQueryPlanVersionProvider())
 	require.NoError(b, err)
-	planner.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(true, reg, opts.Logger))
+	planner.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(reg, opts.Logger))
 
 	timeRange := types.NewInstantQueryTimeRange(time.Now())
 
 	for _, expr := range testCases {
 		b.Run(expr, func(b *testing.B) {
 			for b.Loop() {
-				_, err := planner.NewQueryPlan(ctx, expr, timeRange, observer)
+				_, err := planner.NewQueryPlan(ctx, expr, timeRange, false, observer)
 
 				if err != nil {
 					require.NoError(b, err)
@@ -957,4 +987,32 @@ func BenchmarkOptimizationPass(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestShouldSkipChild(t *testing.T) {
+	pass := commonsubexpressionelimination.NewOptimizationPass(nil, nil)
+
+	// Test info function - should skip only 2nd children
+	infoFunctionCall := &core.FunctionCall{
+		FunctionCallDetails: &core.FunctionCallDetails{
+			Function: functions.FUNCTION_INFO,
+		},
+	}
+
+	require.False(t, pass.ShouldSkipChild(infoFunctionCall, 0), "1st argument to info function should not be skipped")
+	require.True(t, pass.ShouldSkipChild(infoFunctionCall, 1), "2nd argument to info function should be skipped")
+
+	// Test other function - should not skip any children
+	otherFunctionCall := &core.FunctionCall{
+		FunctionCallDetails: &core.FunctionCallDetails{
+			Function: functions.FUNCTION_RATE,
+		},
+	}
+
+	require.False(t, pass.ShouldSkipChild(otherFunctionCall, 0), "1st argument to other function should not be skipped")
+	require.False(t, pass.ShouldSkipChild(otherFunctionCall, 1), "2nd argument to other function should not be skipped")
+
+	// Test non-function node - should not skip any children
+	nonFunctionNode := &core.VectorSelector{}
+	require.False(t, pass.ShouldSkipChild(nonFunctionNode, 0), "non-function node children should not be skipped")
 }

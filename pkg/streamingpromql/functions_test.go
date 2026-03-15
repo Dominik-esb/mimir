@@ -30,7 +30,7 @@ func TestFunctionDeduplicateAndMerge(t *testing.T) {
 	opts := NewTestEngineOpts()
 	planner, err := NewQueryPlanner(opts, NewMaximumSupportedVersionQueryPlanVersionProvider())
 	require.NoError(t, err)
-	engine, err := NewEngine(opts, NewStaticQueryLimitsProvider(0), stats.NewQueryMetrics(nil), planner)
+	engine, err := NewEngine(opts, stats.NewQueryMetrics(nil), planner)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -79,6 +79,7 @@ func TestFunctionDeduplicateAndMerge(t *testing.T) {
 		"hour":                         `hour({__name__=~"float.*"})`,
 		"idelta":                       `idelta({__name__=~"float.*"}[1m])`,
 		"increase":                     `increase({__name__=~"float.*"}[1m])`,
+		"info":                         `<skip>`, // info() doesn't drop the metric name, so this test doesn't apply.
 		"irate":                        `irate({__name__=~"float.*"}[1m])`,
 		"label_join":                   `label_join({__name__=~"float.*"}, "__name__", "", "env")`,
 		"label_replace":                `label_replace({__name__=~"float.*"}, "__name__", "$1", "env", "(.*)")`,

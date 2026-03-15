@@ -65,8 +65,6 @@ The following features are currently experimental:
 - Compactor
   - Limit blocks processed in each compaction cycle. Blocks uploaded prior to the maximum lookback aren't processed.
     - `-compactor.max-lookback`
-  - Enable the compactor to upload sparse index headers to object storage during compaction cycles.
-    - `-compactor.upload-sparse-index-headers`
 - Ruler
   - Allow defining limits on the maximum number of rules allowed in a rule group by namespace and the maximum number of rule groups by namespace. If set, this supersedes the `-ruler.max-rules-per-rule-group` and `-ruler.max-rule-groups-per-tenant` limits.
   - `-ruler.max-rules-per-rule-group-by-namespace`
@@ -123,6 +121,9 @@ The following features are currently experimental:
   - Early TSDB Head compaction to reduce in-memory series:
     - `-blocks-storage.tsdb.early-head-compaction-min-in-memory-series`
     - `-blocks-storage.tsdb.early-head-compaction-min-estimated-series-reduction-percentage`
+  - Per-tenant early TSDB Head compaction based on owned series count:
+    - `-ingester.early-head-compaction-owned-series-threshold`
+    - `-ingester.early-head-compaction-min-estimated-series-reduction-percentage`
   - Timely head compaction (`-blocks-storage.tsdb.timely-head-compaction-enabled`)
   - Count owned series and use them to enforce series limits:
     - `-ingester.track-ingester-owned-series`
@@ -191,9 +192,11 @@ The following features are currently experimental:
   - Index lookup planning comparison to validate planning correctness
     - `-blocks-storage.tsdb.index-lookup-planning-enabled`
     - `-blocks-storage.tsdb.index-lookup-planning-comparison-portion`
+  - Per-tenant max number of active series additional custom trackers is configurable via `-validation.max-active-series-additional-custom-trackers`.
+  - File based Kafka consumer group offset tracking enforcement
+    - `-ingest-storage.kafka.consumer-group-offset-commit-file-enforced`
 - Querier
   - Max concurrency for tenant federated queries (`-tenant-federation.max-concurrent`)
-  - Allow streaming of `/active_series` responses to the frontend (`-querier.response-streaming-enabled`)
   - [Mimir query engine](https://grafana.com/docs/mimir/<MIMIR_VERSION>/references/architecture/mimir-query-engine) (`-querier.query-engine` and `-querier.enable-query-engine-fallback`, and all flags beginning with `-querier.mimir-query-engine`)
   - Maximum estimated memory consumption per query limit (`-querier.max-estimated-memory-consumption-per-query`)
   - Enable the experimental Prometheus feature for delayed name removal (`-querier.enable-delayed-name-removal`)
@@ -203,7 +206,6 @@ The following features are currently experimental:
   - Store-gateway health check grace period (`-querier.store-gateway-client.health-check-grace-period`)
   - Ingester health check grace period (`-distributor.ingester-health-check-grace-period`)
 - Query-frontend
-
   - Lower TTL for cache entries overlapping the out-of-order samples ingestion window (re-using `-ingester.out-of-order-window` from ingesters)
   - Sharding of active series queries (`-query-frontend.shard-active-series-queries`)
   - Server-side write timeout for responses to active series requests (`-query-frontend.active-series-write-timeout`)
@@ -216,10 +218,10 @@ The following features are currently experimental:
   - [Mimir query engine](https://grafana.com/docs/mimir/<MIMIR_VERSION>/references/architecture/mimir-query-engine) (`-query-frontend.query-engine` and `-query-frontend.enable-query-engine-fallback`)
   - Remote execution of queries in queriers: `-query-frontend.enable-remote-execution=true` and `-query-frontend.enable-multiple-node-remote-execution-requests=true`
   - Performing query sharding within MQE: `-query-frontend.use-mimir-query-engine-for-sharding=true`
+  - Computing multiple aggregations over the same data without buffering: `-querier.mimir-query-engine.enable-multi-aggregation=true`
   - Rewriting of queries to optimize processing: `-query-frontend.rewrite-histogram-queries` and `-query-frontend.rewrite-propagate-matchers`
   - Enable experimental Prometheus extended range selector modifiers `smoothed` and `anchored` (`-query-frontend.enabled-promql-extended-range-selectors=smoothed,anchored`)
   - Experimental PromQL functions and aggregations, including `mad_over_time`, `ts_of_min_over_time`, `ts_of_max_over_time`, `ts_of_first_over_time`, `ts_of_last_over_time`, `sort_by_label`, `sort_by_label_desc`, `limitk` and `limit_ratio` (`-query-frontend.enabled-promql-experimental-functions=...`)
-
 - Query-scheduler
   - `-query-scheduler.querier-forget-delay`
 - Store-gateway
@@ -258,12 +260,21 @@ The following features are currently experimental:
     - Assuming that a gRPC client configuration can be reached via `-<grpc-client-config-path>`, cluster validation label is configured via: `-<grpc-client-config-path>.cluster-validation.label`.
     - The cluster validation label of all gRPC clients can be configured via `-common.client-cluster-validation.label`.
     - Requests with invalid cluster validation labels are tracked via the `cortex_client_invalid_cluster_validation_label_requests_total` metric.
+- Common
+  - Instrument a fraction of pooled objects for references that outlive their lifetime.
+    - Only implemented for objects embedding `mimirpb.BufferHolder`.
+    - Flags:
+      - `-common.instrument-reference-leaks.percentage`
+      - `-common.instrument-reference-leaks.before-reuse-period`
+      - `-common.instrument-reference-leaks.max-inflight-instrumented-bytes`
 - Preferred available zones for querying ingesters and store-gateways
   - `-querier.prefer-availability-zones`
 - Memberlist zone-aware routing
   - `-memberlist.zone-aware-routing.enabled`
   - `-memberlist.zone-aware-routing.instance-availability-zone`
   - `-memberlist.zone-aware-routing.role`
+- Memberlist rejoin custom seed nodes
+  - `-memberlist.rejoin-seed-nodes`
 - Jsonnet
   - `$._config.autoscaling_oom_protection_enabled` controls whether to add extra KEDA ScaledObject trigger to prevent from down-scaling during OOM kills, if memory trigger is disabled
 

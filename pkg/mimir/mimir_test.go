@@ -58,6 +58,7 @@ import (
 	"github.com/grafana/mimir/pkg/storage/bucket/filesystem"
 	"github.com/grafana/mimir/pkg/storage/bucket/s3"
 	"github.com/grafana/mimir/pkg/storage/tsdb"
+	"github.com/grafana/mimir/pkg/storage/tsdb/indexcache"
 	"github.com/grafana/mimir/pkg/storegateway"
 	"github.com/grafana/mimir/pkg/util"
 	util_log "github.com/grafana/mimir/pkg/util/log"
@@ -85,6 +86,7 @@ func TestMimir(t *testing.T) {
 				KVStore: kv.Config{
 					Store: "inmemory",
 				},
+				NumTokens:              512,
 				ReplicationFactor:      3,
 				InstanceInterfaceNames: []string{"en0", "eth0", "wlan0", "lo0", "lo"},
 				HeartbeatPeriod:        5 * time.Second,
@@ -101,9 +103,9 @@ func TestMimir(t *testing.T) {
 				},
 			},
 			BucketStore: tsdb.BucketStoreConfig{
-				IndexCache: tsdb.IndexCacheConfig{
+				IndexCache: indexcache.IndexCacheConfig{
 					BackendConfig: cache.BackendConfig{
-						Backend: tsdb.IndexCacheBackendInMemory,
+						Backend: indexcache.BackendInMemory,
 					},
 				},
 			},
@@ -1051,6 +1053,20 @@ func getHostnameAndRandomPort(t *testing.T) (string, int) {
 	portNum, err := strconv.Atoi(port)
 	require.NoError(t, err)
 	return host, portNum
+}
+
+func TestNewReturnsErrorOnEmptyTarget(t *testing.T) {
+	args := []string{
+		"-target=",
+	}
+	var cfg Config
+	fs := flag.NewFlagSet("test", flag.PanicOnError)
+	cfg.RegisterFlags(fs, log.NewNopLogger())
+	require.NoError(t, fs.Parse(args))
+
+	_, err := New(cfg, prometheus.NewPedanticRegistry())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no target module specified")
 }
 
 type mockGrpcServiceHandler struct {

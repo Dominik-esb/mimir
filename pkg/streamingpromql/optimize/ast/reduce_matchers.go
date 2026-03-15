@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 
+	"github.com/grafana/mimir/pkg/streamingpromql/planning/core"
 	"github.com/grafana/mimir/pkg/util"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 )
@@ -48,10 +49,10 @@ func (c *ReduceMatchers) Apply(ctx context.Context, root parser.Expr) (parser.Ex
 	c.attempts.Inc()
 
 	matchersReduced := false
-	parser.Inspect(root, func(node parser.Node, _ []parser.Node) error {
+	c.apply(root, func(node parser.Node, keepWildcardsForInfoDataSelector bool) {
 		switch expr := node.(type) {
 		case *parser.VectorSelector:
-			retained, dropped := reduceMatchers(expr.LabelMatchers)
+			retained, dropped := reduceMatchers(expr.LabelMatchers, keepWildcardsForInfoDataSelector)
 
 			if len(dropped) > 0 {
 				expr.LabelMatchers = retained
@@ -63,7 +64,7 @@ func (c *ReduceMatchers) Apply(ctx context.Context, root parser.Expr) (parser.Ex
 				)
 			}
 		case *parser.MatrixSelector:
-			retained, dropped := reduceMatchers(expr.VectorSelector.(*parser.VectorSelector).LabelMatchers)
+			retained, dropped := reduceMatchers(expr.VectorSelector.(*parser.VectorSelector).LabelMatchers, keepWildcardsForInfoDataSelector)
 
 			if len(dropped) > 0 {
 				expr.VectorSelector.(*parser.VectorSelector).LabelMatchers = retained
@@ -75,8 +76,7 @@ func (c *ReduceMatchers) Apply(ctx context.Context, root parser.Expr) (parser.Ex
 				)
 			}
 		}
-		return nil
-	})
+	}, false)
 
 	if matchersReduced {
 		c.success.Inc()
@@ -85,13 +85,36 @@ func (c *ReduceMatchers) Apply(ctx context.Context, root parser.Expr) (parser.Ex
 	return root, nil
 }
 
-func reduceMatchers(existing []*labels.Matcher) (retained []*labels.Matcher, dropped []*labels.Matcher) {
+func (c *ReduceMatchers) apply(node parser.Node, fn func(parser.Node, bool), keepWildcardsForInfoDataSelector bool) {
+	if node == nil {
+		return
+	}
+
+	if call, ok := node.(*parser.Call); ok && call.Func.Name == "info" {
+		// Only reduce matchers for the first argument of info(), not the second.
+		c.apply(call.Args[0], fn, false)
+		// The InsertOmittedTargetInfoSelector AST pass ensures there are always 2 arguments.
+		// Check len(Args) == 2 for safety in case the pass doesn't run (e.g., in tests).
+		if len(call.Args) == 2 {
+			c.apply(call.Args[1], fn, true)
+		}
+		return
+	}
+
+	fn(node, keepWildcardsForInfoDataSelector)
+
+	for child := range parser.ChildrenIter(node) {
+		c.apply(child, fn, false)
+	}
+}
+
+func reduceMatchers(existing []*labels.Matcher, keepWildcardsForInfoDataSelector bool) (retained []*labels.Matcher, dropped []*labels.Matcher) {
 	// If there's only one matcher, we can't reduce anything.
 	if len(existing) <= 1 {
 		return existing, nil
 	}
 
-	allowedMatchers := setReduceMatchers(existing)
+	allowedMatchers := setReduceMatchers(existing, keepWildcardsForInfoDataSelector)
 	// Rebuild a list of retained and dropped matchers. The dropped matchers are used for
 	// logging purposes to record all matchers have been removed from the query.
 	return buildOutMatchers(existing, allowedMatchers)
@@ -104,22 +127,13 @@ func buildOutMatchers(inMatchers []*labels.Matcher, allowedOutMatchers []*labels
 	dedupedMatchers, dropped := dedupeMatchers(inMatchers)
 
 	// allowedInResultSet maps the relevant values of matchers returned by setReduce.
-	// The innermost map value tracks whether that matcher is already represented in outMatchers.
+	// We use core.LabelMatcher as the key here because labels.Matcher contains a FastRegexMatcher instance
+	// which means that two otherwise identical matchers are considered different.
 	// We do it this way instead of using the matcher string via m.String()
 	// to avoid unnecessary memory allocations when building the string.
-	allowedInResultSet := make(map[labels.MatchType]map[string]map[string]bool, 4)
+	allowedInResultSet := make(map[core.LabelMatcher]bool, len(allowedOutMatchers))
 	for _, m := range allowedOutMatchers {
-		if _, ok := allowedInResultSet[m.Type][m.Name]; ok {
-			allowedInResultSet[m.Type][m.Name][m.Value] = false
-			continue
-		}
-		val := map[string]bool{m.Value: false}
-		if _, ok := allowedInResultSet[m.Type]; ok {
-			allowedInResultSet[m.Type][m.Name] = val
-			continue
-		}
-		name := map[string]map[string]bool{m.Name: val}
-		allowedInResultSet[m.Type] = name
+		allowedInResultSet[core.LabelMatcherFromPrometheusType(m)] = false
 	}
 	// If we have reached the last deduped input matcher and are still not returning any matchers,
 	// we should return at least one matcher. This can happen if all input matchers are wildcard matchers.
@@ -131,9 +145,9 @@ func buildOutMatchers(inMatchers []*labels.Matcher, allowedOutMatchers []*labels
 		// allowedOutMatchers is used to both keep track of all unique matchers (evidenced by existence in the map),
 		// and whether the matcher has already been seen and added to a set of output matchers (evidenced by the value in the map).
 		// We only want to add the matcher if it hasn't already been added to an output slice.
-		if alreadyInResultSet, allowed := allowedInResultSet[m.Type][m.Name][m.Value]; allowed && !alreadyInResultSet {
+		if alreadyInResultSet, allowed := allowedInResultSet[core.LabelMatcherFromPrometheusType(m)]; allowed && !alreadyInResultSet {
 			outMatchers = append(outMatchers, m)
-			allowedInResultSet[m.Type][m.Name][m.Value] = true
+			allowedInResultSet[core.LabelMatcherFromPrometheusType(m)] = true
 		} else {
 			dropped = append(dropped, m)
 		}
@@ -148,7 +162,7 @@ func buildOutMatchers(inMatchers []*labels.Matcher, allowedOutMatchers []*labels
 //   - not-equals matchers are dropped if they match any equals matcher value,
 //     or if any not-regex matchers also exclude the not-equals matcher value.
 //   - regex and not-regex matchers are dropped if they match any equals matcher value.
-func setReduceMatchers(ms []*labels.Matcher) []*labels.Matcher {
+func setReduceMatchers(ms []*labels.Matcher, keepWildcardsForInfoDataSelector bool) []*labels.Matcher {
 	// Group matchers by their label names so we can evaluate each label name independently
 	matchersByName := make(map[string][]*labels.Matcher)
 	for _, m := range ms {
@@ -167,41 +181,28 @@ func setReduceMatchers(ms []*labels.Matcher) []*labels.Matcher {
 		if len(equalsMatchers) > 1 {
 			continue
 		}
-		outMatchers = append(outMatchers, filterRegexMatchers(matchersByType, labels.MatchRegexp)...)
+		outMatchers = append(outMatchers, filterRegexMatchers(matchersByType, labels.MatchRegexp, keepWildcardsForInfoDataSelector)...)
 		outMatchers = append(outMatchers, filterNotEqualsMatchers(matchersByType)...)
-		outMatchers = append(outMatchers, filterRegexMatchers(matchersByType, labels.MatchNotRegexp)...)
+		outMatchers = append(outMatchers, filterRegexMatchers(matchersByType, labels.MatchNotRegexp, false)...)
 	}
 	return outMatchers
 }
 
 // dedupeMatchers dedupes matchers based on their type, name, and value.
 func dedupeMatchers(ms []*labels.Matcher) ([]*labels.Matcher, []*labels.Matcher) {
-	deduped := make(map[labels.MatchType]map[string]map[string]*labels.Matcher, 4)
+	deduped := make(map[core.LabelMatcher]*labels.Matcher, len(ms))
 	dropped := make([]*labels.Matcher, 0, 1)
 	for _, m := range ms {
-		if _, ok := deduped[m.Type][m.Name][m.Value]; ok {
+		key := core.LabelMatcherFromPrometheusType(m)
+		if _, ok := deduped[key]; ok {
 			dropped = append(dropped, m)
 			continue
 		}
-		if _, ok := deduped[m.Type][m.Name]; ok {
-			deduped[m.Type][m.Name][m.Value] = m
-			continue
-		}
-		valPtr := map[string]*labels.Matcher{m.Value: m}
-		if _, ok := deduped[m.Type]; ok {
-			deduped[m.Type][m.Name] = valPtr
-			continue
-		}
-		name := map[string]map[string]*labels.Matcher{m.Name: valPtr}
-		deduped[m.Type] = name
+		deduped[key] = m
 	}
 	outMatchers := make([]*labels.Matcher, 0, len(deduped))
-	for _, nameMap := range deduped {
-		for _, valMap := range nameMap {
-			for _, ptr := range valMap {
-				outMatchers = append(outMatchers, ptr)
-			}
-		}
+	for _, ptr := range deduped {
+		outMatchers = append(outMatchers, ptr)
 	}
 	return outMatchers, dropped
 }
@@ -218,14 +219,14 @@ func matcherMatchesAnyValues(matcher *labels.Matcher, matchers []*labels.Matcher
 
 // filterRegexMatchers returns a subset of regex matchers which would actually reduce the result set size for either positive or negative regex matchers.
 // A regex matcher is dropped if:
-//   - it is a positive regex matcher and matches all values (foo=~".*")
+//   - it is a positive regex matcher and matches all values (foo=~".*") AND keepWildcardsForInfoDataSelector is false
 //   - it matches any equals matches, since the equals matcher will match a strict subset of values that the regex matcher would.
 //
 // Examples:
 //   - {foo=~".*bar.*", foo="bar"}, foo=~".*bar.*" is dropped because foo="bar" is a subset of foo=~".*bar.*"
 //   - {foo!~".*bar.*", foo="bar"}, foo!~".*bar.*" is not dropped because it covers a different set of values than foo="bar"
 //   - {foo!~".*baz.*", foo="bar"}, foo!~".*baz.*" is dropped because foo="bar" is a subset of foo!~".*baz.*"
-func filterRegexMatchers(mf map[labels.MatchType][]*labels.Matcher, regexType labels.MatchType) []*labels.Matcher {
+func filterRegexMatchers(mf map[labels.MatchType][]*labels.Matcher, regexType labels.MatchType, keepWildcardsForInfoDataSelector bool) []*labels.Matcher {
 	var matchers []*labels.Matcher
 	switch regexType {
 	case labels.MatchRegexp:
@@ -238,8 +239,8 @@ func filterRegexMatchers(mf map[labels.MatchType][]*labels.Matcher, regexType la
 	}
 	outMatchers := make([]*labels.Matcher, 0, len(matchers))
 	for _, m := range matchers {
-		// Always drop wildcard matchers
-		if m.Type == labels.MatchRegexp && m.Value == ".*" {
+		// Always drop wildcard matchers if they are not in an info data selector.
+		if !keepWildcardsForInfoDataSelector && m.Type == labels.MatchRegexp && m.Value == ".*" {
 			continue
 		}
 		// If m matches any equals matcher, that equals matcher is a subset of the regex,

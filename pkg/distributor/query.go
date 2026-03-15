@@ -82,13 +82,14 @@ func (d *Distributor) QueryExemplars(ctx context.Context, from, to model.Time, m
 }
 
 // QueryStream queries multiple ingesters via the streaming interface and returns a big ol' set of chunks.
-func (d *Distributor) QueryStream(ctx context.Context, queryMetrics *stats.QueryMetrics, from, to model.Time, matchers ...*labels.Matcher) (ingester_client.CombinedQueryStreamResponse, error) {
+func (d *Distributor) QueryStream(ctx context.Context, queryMetrics *stats.QueryMetrics, from, to model.Time, projectionInclude bool, projectionLabels []string, matchers ...*labels.Matcher) (ingester_client.CombinedQueryStreamResponse, error) {
 	var result ingester_client.CombinedQueryStreamResponse
 	err := instrument.CollectedRequest(ctx, "Distributor.QueryStream", d.queryDuration, instrument.ErrorCode, func(ctx context.Context) error {
-		req, err := ingester_client.ToQueryRequest(from, to, matchers)
+		req, err := ingester_client.ToQueryRequest(from, to, projectionInclude, projectionLabels, matchers)
 		if err != nil {
 			return err
 		}
+
 		req.StreamingChunksBatchSize = d.cfg.StreamingChunksPerIngesterSeriesBufferSize
 
 		replicationSets, err := d.getIngesterReplicationSetsForQuery(ctx)
@@ -120,15 +121,18 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 	}
 
 	if d.cfg.IngestStorageConfig.Enabled {
-		shardSize := d.limits.IngestionPartitionsTenantShardSize(userID)
 		r := d.partitionsRing
 
-		// If tenant uses shuffle sharding, we should only query partitions which are part of the tenant's subring.
-		if lookbackPeriod := d.cfg.ShuffleShardingLookbackPeriod; shardSize > 0 && lookbackPeriod > 0 {
-			r, err = r.ShuffleShardWithLookback(userID, shardSize, lookbackPeriod, time.Now())
-			if err != nil {
-				return nil, err
-			}
+		// Build a subring to query. We use ShuffleShardWithLookback() to limit the partitions to query
+		// to the tenant's shard (when shuffle sharding is enabled) and to filter out inactive partitions
+		// that have been inactive for longer than the lookback period.
+		shardSize := 0
+		if d.cfg.ShuffleShardingEnabled {
+			shardSize = d.limits.IngestionPartitionsTenantShardSize(userID)
+		}
+		r, err = r.ShuffleShardWithLookback(userID, shardSize, d.cfg.IngestersLookbackPeriod, time.Now())
+		if err != nil {
+			return nil, err
 		}
 
 		return r.GetReplicationSetsForOperation(readNoExtend)
@@ -137,7 +141,11 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 	// Lookup ingesters ring because ingest storage is disabled.
 	shardSize := d.limits.IngestionTenantShardSize(userID)
 	r := d.ingestersRing
-	r = r.ShuffleShardWithLookback(userID, shardSize, d.cfg.ShuffleShardingLookbackPeriod, time.Now())
+
+	// If tenant uses shuffle sharding, we should only query ingesters which are part of the tenant's subring.
+	if lookbackPeriod := d.cfg.IngestersLookbackPeriod; d.cfg.ShuffleShardingEnabled && lookbackPeriod > 0 {
+		r = r.ShuffleShardWithLookback(userID, shardSize, lookbackPeriod, time.Now())
+	}
 
 	replicationSet, err := r.GetReplicationSetForOperation(readNoExtend)
 	if err != nil {
@@ -264,8 +272,13 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSets [
 			return result, err
 		}
 
+		deduplicator, err := limiter.SeriesLabelsDeduplicatorFromContext(ctx)
+		if err != nil {
+			return result, err
+		}
+
 		for {
-			labelsBatch, isEOS, err := result.receiveResponse(stream, queryLimiter, memoryConsumptionTracker)
+			labelsBatch, isEOS, err := result.receiveResponse(stream, queryLimiter, memoryConsumptionTracker, deduplicator)
 			if errors.Is(err, io.EOF) {
 				// We will never get an EOF here from an ingester that is streaming chunks, so we don't need to do anything to set up streaming here.
 				return result, nil
@@ -335,7 +348,7 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSets [
 
 // receiveResponse receives a response from stream returns the label sets of each series.
 // A bool is also returned to indicate whether the end of the stream has been reached.
-func (r *ingesterQueryResult) receiveResponse(stream ingester_client.Ingester_QueryStreamClient, queryLimiter *limiter.QueryLimiter, memoryConsumptionTracker *limiter.MemoryConsumptionTracker) ([]labels.Labels, bool, error) {
+func (r *ingesterQueryResult) receiveResponse(stream ingester_client.Ingester_QueryStreamClient, queryLimiter *limiter.QueryLimiter, memoryConsumptionTracker *limiter.MemoryConsumptionTracker, deduplicator limiter.SeriesLabelsDeduplicator) ([]labels.Labels, bool, error) {
 	resp, err := stream.Recv()
 	if err != nil {
 		return nil, false, err
@@ -347,11 +360,12 @@ func (r *ingesterQueryResult) receiveResponse(stream ingester_client.Ingester_Qu
 		for _, s := range resp.StreamingSeries {
 			l := mimirpb.FromLabelAdaptersToLabelsWithCopy(s.Labels)
 
-			if err := memoryConsumptionTracker.IncreaseMemoryConsumptionForLabels(l); err != nil {
+			uniqueSeriesLabels, err := deduplicator.Deduplicate(l, memoryConsumptionTracker)
+			if err != nil {
 				return nil, false, err
 			}
 
-			if err := queryLimiter.AddSeries(l); err != nil {
+			if err := queryLimiter.AddSeries(uniqueSeriesLabels); err != nil {
 				return nil, false, err
 			}
 
@@ -364,7 +378,7 @@ func (r *ingesterQueryResult) receiveResponse(stream ingester_client.Ingester_Qu
 				return nil, false, err
 			}
 
-			labelsBatch = append(labelsBatch, l)
+			labelsBatch = append(labelsBatch, uniqueSeriesLabels)
 		}
 
 		return labelsBatch, resp.IsEndOfSeriesStream, nil

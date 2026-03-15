@@ -39,8 +39,8 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	prom_storage "github.com/prometheus/prometheus/storage"
 	"go.uber.org/atomic"
+	"go.yaml.in/yaml/v3"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	"gopkg.in/yaml.v3"
 
 	"github.com/grafana/mimir/pkg/alertmanager"
 	"github.com/grafana/mimir/pkg/alertmanager/alertstore"
@@ -53,7 +53,6 @@ import (
 	"github.com/grafana/mimir/pkg/continuoustest"
 	"github.com/grafana/mimir/pkg/costattribution"
 	"github.com/grafana/mimir/pkg/distributor"
-	"github.com/grafana/mimir/pkg/flusher"
 	"github.com/grafana/mimir/pkg/frontend"
 	"github.com/grafana/mimir/pkg/frontend/querymiddleware"
 	"github.com/grafana/mimir/pkg/ingester"
@@ -121,7 +120,6 @@ type Config struct {
 	Querier                        querier.Config                  `yaml:"querier"`
 	IngesterClient                 client.Config                   `yaml:"ingester_client"`
 	Ingester                       ingester.Config                 `yaml:"ingester"`
-	Flusher                        flusher.Config                  `yaml:"flusher"`
 	LimitsConfig                   validation.Limits               `yaml:"limits"`
 	Worker                         querier_worker.Config           `yaml:"frontend_worker"`
 	Frontend                       frontend.CombinedFrontendConfig `yaml:"frontend"`
@@ -192,7 +190,6 @@ func (c *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
 	c.Querier.RegisterFlags(f, logger)
 	c.IngesterClient.RegisterFlags(f)
 	c.Ingester.RegisterFlags(f, logger)
-	c.Flusher.RegisterFlags(f)
 	c.LimitsConfig.RegisterFlags(f)
 	c.Worker.RegisterFlags(f)
 	c.Frontend.RegisterFlags(f, logger)
@@ -352,6 +349,9 @@ func (c *Config) Validate(log log.Logger) error {
 	}
 	if err := c.OverridesExporter.Validate(); err != nil {
 		return errors.Wrap(err, "invalid overrides-exporter config")
+	}
+	if err := c.Common.InstrumentRefLeaks.Validate(); err != nil {
+		return errors.Wrap(err, "invalid instrument-ref-leaks config")
 	}
 
 	// validate the default limits
@@ -713,11 +713,16 @@ func UnmarshalCommonYAML(value *yaml.Node, inheriters ...CommonConfigInheriter) 
 		for name, loc := range inheritance.ClientClusterValidation {
 			specificClusterValidationLocations[name] = loc
 		}
+		specificInstrumentRefLeaksLocations := specificLocationsUnmarshaler{}
+		for name, loc := range inheritance.InstrumentRefLeaksConfig {
+			specificInstrumentRefLeaksLocations[name] = loc
+		}
 
 		common := configWithCustomCommonUnmarshaler{
 			Common: &commonConfigUnmarshaler{
 				Storage:                 &specificStorageLocations,
 				ClientClusterValidation: &specificClusterValidationLocations,
+				InstrumentRefLeaks:      &specificInstrumentRefLeaksLocations,
 			},
 		}
 
@@ -787,17 +792,20 @@ func inheritFlags(log log.Logger, orig flagext.RegisteredFlagsTracker, dest flag
 type CommonConfig struct {
 	Storage                 bucket.StorageBackendConfig         `yaml:"storage"`
 	ClientClusterValidation clusterutil.ClusterValidationConfig `yaml:"client_cluster_validation" category:"experimental"`
+	InstrumentRefLeaks      mimirpb.InstrumentRefLeaksConfig    `yaml:"instrument_ref_leaks" category:"experimental"`
 }
 
 type CommonConfigInheritance struct {
-	Storage                 map[string]*bucket.StorageBackendConfig
-	ClientClusterValidation map[string]*clusterutil.ClusterValidationConfig
+	Storage                  map[string]*bucket.StorageBackendConfig
+	ClientClusterValidation  map[string]*clusterutil.ClusterValidationConfig
+	InstrumentRefLeaksConfig map[string]*mimirpb.InstrumentRefLeaksConfig
 }
 
 // RegisterFlags registers flag.
 func (c *CommonConfig) RegisterFlags(f *flag.FlagSet) {
 	c.Storage.RegisterFlagsWithPrefix("common.storage.", f)
 	c.ClientClusterValidation.RegisterFlagsWithPrefix("common.client-cluster-validation.", f)
+	c.InstrumentRefLeaks.RegisterFlagsWithPrefix("common.instrument-reference-leaks.", f)
 }
 
 // configWithCustomCommonUnmarshaler unmarshals config with custom unmarshaler for the `common` field.
@@ -814,6 +822,7 @@ type configWithCustomCommonUnmarshaler struct {
 type commonConfigUnmarshaler struct {
 	Storage                 *specificLocationsUnmarshaler `yaml:"storage"`
 	ClientClusterValidation *specificLocationsUnmarshaler `yaml:"client_cluster_validation"`
+	InstrumentRefLeaks      *specificLocationsUnmarshaler `yaml:"instrument_ref_leaks"`
 }
 
 // specificLocationsUnmarshaler will unmarshal yaml into specific locations.
@@ -847,10 +856,10 @@ type Mimir struct {
 	IngesterPartitionInstanceRing    *ring.PartitionInstanceRing
 	TenantLimits                     validation.TenantLimits
 	Overrides                        *validation.Overrides
+	QueryLimitsProvider              streamingpromql.QueryLimitsProvider
 	ActiveGroupsCleanup              *util.ActiveGroupsCleanupService
 	Distributor                      *distributor.Distributor
 	Ingester                         *ingester.Ingester
-	Flusher                          *flusher.Flusher
 	RuntimeConfig                    *runtimeconfig.Manager
 	QuerierQueryable                 prom_storage.SampleAndChunkQueryable
 	ExemplarQueryable                prom_storage.ExemplarQueryable
@@ -900,6 +909,10 @@ type Mimir struct {
 
 // New makes a new Mimir.
 func New(cfg Config, reg prometheus.Registerer) (*Mimir, error) {
+	if len(cfg.Target) == 0 {
+		return nil, fmt.Errorf("no target module specified, the -target flag must be set to a valid module (e.g. \"all\")")
+	}
+
 	if cfg.PrintConfig {
 		if err := yaml.NewEncoder(os.Stdout).Encode(&cfg); err != nil {
 			fmt.Println("Error encoding config:", err)
@@ -908,6 +921,14 @@ func New(cfg Config, reg prometheus.Registerer) (*Mimir, error) {
 	}
 
 	setUpGoRuntimeMetrics(cfg, reg)
+
+	mimirpb.CustomCodecConfig{
+		InstrumentRefLeaksConfig: mimirpb.InstrumentRefLeaksConfig{
+			Percentage:                   cfg.Common.InstrumentRefLeaks.Percentage,
+			BeforeReusePeriod:            cfg.Common.InstrumentRefLeaks.BeforeReusePeriod,
+			MaxInflightInstrumentedBytes: cfg.Common.InstrumentRefLeaks.MaxInflightInstrumentedBytes,
+		},
+	}.RegisterGlobally(reg)
 
 	if cfg.TenantFederation.Enabled && cfg.Ruler.TenantFederation.Enabled {
 		util_log.WarnExperimentalUse("ruler.tenant-federation")

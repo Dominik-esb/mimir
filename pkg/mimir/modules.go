@@ -46,7 +46,6 @@ import (
 	"github.com/grafana/mimir/pkg/continuoustest"
 	"github.com/grafana/mimir/pkg/costattribution"
 	"github.com/grafana/mimir/pkg/distributor"
-	"github.com/grafana/mimir/pkg/flusher"
 	"github.com/grafana/mimir/pkg/frontend"
 	"github.com/grafana/mimir/pkg/frontend/querymiddleware"
 	"github.com/grafana/mimir/pkg/frontend/transport"
@@ -67,7 +66,6 @@ import (
 	streamingpromqlcompat "github.com/grafana/mimir/pkg/streamingpromql/compat"
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/ast/sharding"
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan/remoteexec"
-	"github.com/grafana/mimir/pkg/streamingpromql/planning"
 	"github.com/grafana/mimir/pkg/streamingpromql/planning/analysis"
 	"github.com/grafana/mimir/pkg/usagestats"
 	"github.com/grafana/mimir/pkg/usagetracker"
@@ -97,7 +95,6 @@ const (
 	CostAttributionService           string = "cost-attribution-service"
 	Distributor                      string = "distributor"
 	DistributorService               string = "distributor-service"
-	Flusher                          string = "flusher"
 	Ingester                         string = "ingester"
 	IngesterPartitionRing            string = "ingester-partitions-ring"
 	IngesterRing                     string = "ingester-ring"
@@ -470,6 +467,7 @@ func (t *Mimir) initRuntimeConfig() (services.Service, error) {
 
 func (t *Mimir) initOverrides() (serv services.Service, err error) {
 	t.Overrides = validation.NewOverrides(t.Cfg.LimitsConfig, t.TenantLimits)
+	t.QueryLimitsProvider = querier.NewTenantQueryLimitsProvider(t.Overrides)
 	// overrides don't have operational state, nor do they need to do anything more in starting/stopping phase,
 	// so there is no need to return any service.
 	return nil, nil
@@ -501,9 +499,8 @@ func (t *Mimir) initDistributorService() (serv services.Service, err error) {
 	t.Cfg.Distributor.DistributorRing.Common.ListenPort = t.Cfg.Server.GRPCListenPort
 	t.Cfg.Distributor.InstanceLimitsFn = distributorInstanceLimits(t.RuntimeConfig)
 
-	if t.Cfg.Querier.ShuffleShardingIngestersEnabled {
-		t.Cfg.Distributor.ShuffleShardingLookbackPeriod = t.Cfg.BlocksStorage.TSDB.Retention
-	}
+	t.Cfg.Distributor.ShuffleShardingEnabled = t.Cfg.Querier.ShuffleShardingIngestersEnabled
+	t.Cfg.Distributor.IngestersLookbackPeriod = t.Cfg.BlocksStorage.TSDB.Retention
 
 	// Check whether the distributor can join the distributors ring, which is
 	// whenever it's not running as an internal dependency (ie. querier or
@@ -544,7 +541,15 @@ func (t *Mimir) initQueryable() (serv services.Service, err error) {
 
 	// Create a querier queryable and PromQL engine
 	t.QuerierQueryable, t.ExemplarQueryable, t.QuerierEngine, t.QuerierStreamingEngine, err = querier.New(
-		t.Cfg.Querier, t.Overrides, t.Distributor, t.AdditionalStorageQueryables, registerer, util_log.Logger, t.ActivityTracker, t.QuerierQueryPlanner,
+		t.Cfg.Querier,
+		t.Overrides,
+		t.Distributor,
+		t.AdditionalStorageQueryables,
+		registerer,
+		util_log.Logger,
+		t.ActivityTracker,
+		t.QuerierQueryPlanner,
+		t.QueryLimitsProvider,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("could not create queryable: %w", err)
@@ -800,23 +805,6 @@ func (t *Mimir) initIngester() (serv services.Service, err error) {
 	return nil, nil
 }
 
-func (t *Mimir) initFlusher() (serv services.Service, err error) {
-	t.tsdbIngesterConfig()
-
-	t.Flusher, err = flusher.New(
-		t.Cfg.Flusher,
-		t.Cfg.Ingester,
-		t.Overrides,
-		t.Registerer,
-		util_log.Logger,
-	)
-	if err != nil {
-		return
-	}
-
-	return t.Flusher, nil
-}
-
 // initQueryFrontendCodec initializes query frontend codec.
 // NOTE: Grafana Enterprise Metrics depends on this.
 func (t *Mimir) initQueryFrontendCodec() (services.Service, error) {
@@ -872,7 +860,7 @@ func (t *Mimir) initQueryFrontendTopicOffsetsReaders() (services.Service, error)
 // to optimize Prometheus query requests.
 func (t *Mimir) initQueryFrontendTripperware() (serv services.Service, err error) {
 	promqlEngineRegisterer := prometheus.WrapRegistererWith(prometheus.Labels{"engine": "query-frontend"}, t.Registerer)
-	promOpts, mqeOpts := engine.NewPromQLEngineOptions(t.Cfg.Querier.EngineConfig, t.ActivityTracker, util_log.Logger, promqlEngineRegisterer)
+	promOpts, mqeOpts := engine.NewPromQLEngineOptions(t.Cfg.Querier.EngineConfig, t.ActivityTracker, util_log.Logger, promqlEngineRegisterer, t.QueryLimitsProvider)
 	// Disable concurrency limits for sharded queries spawned by the query-frontend.
 	promOpts.ActiveQueryTracker = nil
 	// Always eagerly load selectors so that they are loaded in parallel in the background.
@@ -888,7 +876,7 @@ func (t *Mimir) initQueryFrontendTripperware() (serv services.Service, err error
 		eng = limiter.NewUnlimitedMemoryTrackerPromQLEngine(promql.NewEngine(promOpts))
 	case querier.MimirEngine:
 		var err error
-		t.QueryFrontendStreamingEngine, err = streamingpromql.NewEngine(mqeOpts, streamingpromql.NewStaticQueryLimitsProvider(0), stats.NewQueryMetrics(mqeOpts.CommonOpts.Reg), t.QueryFrontendQueryPlanner)
+		t.QueryFrontendStreamingEngine, err = streamingpromql.NewEngine(mqeOpts, stats.NewQueryMetrics(mqeOpts.CommonOpts.Reg), t.QueryFrontendQueryPlanner)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create Mimir Query Engine: %w", err)
 		}
@@ -952,10 +940,8 @@ func (t *Mimir) initQueryFrontend() (serv services.Service, err error) {
 	t.API.RegisterQueryFrontend2(frontend)
 
 	if t.QueryFrontendStreamingEngine != nil && t.Cfg.Frontend.QueryMiddleware.EnableRemoteExecution {
-		executor := v2.NewRemoteExecutor(frontend, t.Cfg.Frontend.FrontendV2)
-
-		if err := t.QueryFrontendStreamingEngine.RegisterNodeMaterializer(planning.NODE_TYPE_REMOTE_EXEC_CONSUMER, remoteexec.NewRemoteExecutionConsumerMaterializer(executor)); err != nil {
-			return nil, fmt.Errorf("unable to register remote execution materializer: %w", err)
+		if err := v2.RegisterRemoteExecutionMaterializers(t.QueryFrontendStreamingEngine, frontend, t.Cfg.Frontend.FrontendV2); err != nil {
+			return nil, err
 		}
 	}
 
@@ -990,7 +976,7 @@ func (t *Mimir) initQueryFrontend() (serv services.Service, err error) {
 
 func (t *Mimir) initQuerierQueryPlanner() (services.Service, error) {
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"component": "querier"}, t.Registerer)
-	_, mqeOpts := engine.NewPromQLEngineOptions(t.Cfg.Querier.EngineConfig, t.ActivityTracker, util_log.Logger, reg)
+	_, mqeOpts := engine.NewPromQLEngineOptions(t.Cfg.Querier.EngineConfig, t.ActivityTracker, util_log.Logger, reg, t.QueryLimitsProvider)
 
 	// The query plan generated by this querier will only be used in this process, so we can
 	// allow anything this version of Mimir supports.
@@ -1005,7 +991,7 @@ func (t *Mimir) initQuerierQueryPlanner() (services.Service, error) {
 	// Only expose the querier's planner through the analysis endpoint if the query-frontend isn't running in this process.
 	// If the query-frontend is running in this process, it will expose its planner through the analysis endpoint.
 	if !t.Cfg.isQueryFrontendEnabled() {
-		analysisHandler := analysis.Handler(t.QuerierQueryPlanner)
+		analysisHandler := analysis.Handler(t.QuerierQueryPlanner, t.QueryLimitsProvider)
 		t.API.RegisterQueryAnalysisAPI(analysisHandler)
 	}
 
@@ -1014,7 +1000,7 @@ func (t *Mimir) initQuerierQueryPlanner() (services.Service, error) {
 
 func (t *Mimir) initQueryFrontendQueryPlanner() (services.Service, error) {
 	reg := prometheus.WrapRegistererWith(prometheus.Labels{"component": "query-frontend"}, t.Registerer)
-	_, mqeOpts := engine.NewPromQLEngineOptions(t.Cfg.Querier.EngineConfig, t.ActivityTracker, util_log.Logger, reg)
+	_, mqeOpts := engine.NewPromQLEngineOptions(t.Cfg.Querier.EngineConfig, t.ActivityTracker, util_log.Logger, reg, t.QueryLimitsProvider)
 
 	var versionProvider streamingpromql.QueryPlanVersionProvider
 
@@ -1044,7 +1030,7 @@ func (t *Mimir) initQueryFrontendQueryPlanner() (services.Service, error) {
 	// FIXME: results returned by the analysis endpoint won't include any changes made by query middlewares
 	// like sharding, splitting etc.
 	// Once these are running as MQE optimisation passes, they'll automatically be included in the analysis result.
-	analysisHandler := analysis.Handler(t.QueryFrontendQueryPlanner)
+	analysisHandler := analysis.Handler(t.QueryFrontendQueryPlanner, t.QueryLimitsProvider)
 	t.API.RegisterQueryAnalysisAPI(analysisHandler)
 
 	return nil, nil
@@ -1061,7 +1047,7 @@ func (t *Mimir) initRulerStorage() (serv services.Service, err error) {
 	// we do accept stale data for about a polling interval (2 intervals in the worst
 	// case scenario due to the jitter applied).
 	cacheTTL := t.Cfg.Ruler.PollInterval
-	t.RulerStorage, err = ruler.NewRuleStore(context.Background(), t.Cfg.RulerStorage, t.Overrides, rules.FileLoader{}, cacheTTL, util_log.Logger, t.Registerer)
+	t.RulerStorage, err = ruler.NewRuleStore(context.Background(), t.Cfg.RulerStorage, t.Overrides, cacheTTL, util_log.Logger, t.Registerer)
 	return
 }
 
@@ -1073,7 +1059,24 @@ func (t *Mimir) initRuler() (serv services.Service, err error) {
 
 	t.Cfg.Ruler.Ring.Common.ListenPort = t.Cfg.Server.GRPCListenPort
 
+	// embeddedQueryable is used for RestoreForState operation to query ALERTS_FOR_STATE series.
+	// When ruler.query-frontend.address is configured (remote mode):
+	//   - embeddedQueryable is a Prometheus remote read client that makes HTTP requests to /api/v1/read
+	//   - NO memory tracking wrapper applied - querier handles all query execution via query-frontend
+	// When query-frontend is NOT configured (local/embedded mode):
+	//   - embeddedQueryable is returned from querier.New() already wrapped appropriately:
+	//     • MQE engine: wrapped with MemoryTrackingQueryable (tracking at queryable layer)
+	//     • Prometheus engine: NOT wrapped (engine wrapper handles memory tracking)
 	var embeddedQueryable prom_storage.Queryable
+
+	// queryFunc is used to evaluate recording and alerting rule expressions.
+	// When ruler.query-frontend.address is configured (remote mode):
+	//   - queryFunc makes HTTP POST requests to query-frontend's /api/v1/query endpoint
+	//   - Query execution (engine selection, memory tracking, etc.) happens in remote querier
+	// When query-frontend is NOT configured (local/embedded mode):
+	//   - If tenant federation is enabled: queryFunc routes to federated or regular execution based on query
+	//   - If tenant federation is disabled: queryFunc directly executes via rules.EngineQueryFunc(engine, queryable)
+	//     which creates a Query object from the PromQL string and calls Query.Exec()
 	var queryFunc rules.QueryFunc
 
 	if t.Cfg.Ruler.QueryFrontend.Address != "" {
@@ -1097,7 +1100,17 @@ func (t *Mimir) initRuler() (serv services.Service, err error) {
 		// TODO: Consider wrapping logger to differentiate from querier module logger
 		rulerRegisterer := prometheus.WrapRegistererWith(rulerEngine, t.Registerer)
 
-		queryable, _, eng, _, err := querier.New(t.Cfg.Querier, t.Overrides, t.Distributor, t.AdditionalStorageQueryables, rulerRegisterer, util_log.Logger, t.ActivityTracker, t.QuerierQueryPlanner)
+		queryable, _, eng, _, err := querier.New(
+			t.Cfg.Querier,
+			t.Overrides,
+			t.Distributor,
+			t.AdditionalStorageQueryables,
+			rulerRegisterer,
+			util_log.Logger,
+			t.ActivityTracker,
+			t.QuerierQueryPlanner,
+			t.QueryLimitsProvider,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("could not create queryable for ruler: %w", err)
 		}
@@ -1431,6 +1444,7 @@ func (t *Mimir) initContinuousTest() (services.Service, error) {
 	t.ContinuousTestManager = continuoustest.NewManager(t.Cfg.ContinuousTest.Manager, util_log.Logger)
 	t.ContinuousTestManager.AddTest(continuoustest.NewWriteReadSeriesTest(t.Cfg.ContinuousTest.WriteReadSeriesTest, client, util_log.Logger, t.Registerer))
 	t.ContinuousTestManager.AddTest(continuoustest.NewIngestStorageRecordTest(t.Cfg.ContinuousTest.IngestStorageRecordTest, util_log.Logger, t.Registerer))
+	t.ContinuousTestManager.AddTest(continuoustest.NewWriteReadOOOTest(t.Cfg.ContinuousTest.WriteReadOOOTest, client, util_log.Logger, t.Registerer))
 
 	return services.NewBasicService(nil, func(ctx context.Context) error {
 		return t.ContinuousTestManager.Run(ctx)
@@ -1454,7 +1468,6 @@ func (t *Mimir) setupModuleManager() error {
 	mm.RegisterModule(CostAttributionService, t.initCostAttributionService, modules.UserInvisibleModule)
 	mm.RegisterModule(Distributor, t.initDistributor)
 	mm.RegisterModule(DistributorService, t.initDistributorService, modules.UserInvisibleModule)
-	mm.RegisterModule(Flusher, t.initFlusher)
 	mm.RegisterModule(Ingester, t.initIngester)
 	mm.RegisterModule(IngesterPartitionRing, t.initIngesterPartitionRing, modules.UserInvisibleModule)
 	mm.RegisterModule(IngesterRing, t.initIngesterRing, modules.UserInvisibleModule)
@@ -1501,7 +1514,6 @@ func (t *Mimir) setupModuleManager() error {
 		CostAttributionService:           {API, Overrides},
 		Distributor:                      {DistributorService, API, ActiveGroupsCleanupService, Vault, UsageTrackerInstanceRing, UsageTrackerPartitionRing},
 		DistributorService:               {IngesterRing, IngesterPartitionRing, Overrides, Vault, CostAttributionService},
-		Flusher:                          {Overrides, API},
 		Ingester:                         {IngesterService, API, ActiveGroupsCleanupService, Vault},
 		IngesterPartitionRing:            {MemberlistKV, IngesterRing, API},
 		IngesterRing:                     {API, RuntimeConfig, MemberlistKV, Vault},
@@ -1511,7 +1523,7 @@ func (t *Mimir) setupModuleManager() error {
 		OverridesExporter:                {Overrides, MemberlistKV, Vault},
 		Querier:                          {TenantFederation, Vault, QuerierLifecycler},
 		QuerierLifecycler:                {API, RuntimeConfig, MemberlistKV, Vault},
-		QuerierQueryPlanner:              {API, ActivityTracker},
+		QuerierQueryPlanner:              {API, ActivityTracker, Overrides},
 		QuerierRing:                      {API, RuntimeConfig, MemberlistKV, Vault},
 		QueryFrontend:                    {QueryFrontendTripperware, MemberlistKV, Vault},
 		QueryFrontendQueryPlanner:        {API, ActivityTracker, Overrides, QuerierRing},

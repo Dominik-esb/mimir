@@ -1,4 +1,4 @@
-// Copyright 2015 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,9 +22,6 @@ type Function struct {
 	ReturnType   ValueType
 	Experimental bool
 }
-
-// EnableExperimentalFunctions controls whether experimentalFunctions are enabled.
-var EnableExperimentalFunctions bool
 
 // Functions is a list of all functions supported by PromQL, including their types.
 var Functions = map[string]*Function{

@@ -28,6 +28,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"go.uber.org/atomic"
@@ -352,13 +353,27 @@ func (c *BucketCompactor) runCompactionJob(ctx context.Context, job *Job) (shoul
 
 	blocksToCompactDirs := make([]string, len(toCompact))
 	var totalBlockSize int64
+	var totalSamples, totalSeries, totalChunks uint64
 	for ix, meta := range toCompact {
 		blocksToCompactDirs[ix] = filepath.Join(subDir, meta.ULID.String())
 		totalBlockSize += meta.BlockBytes()
+		totalSamples += meta.Stats.NumSamples
+		totalSeries += meta.Stats.NumSeries
+		totalChunks += meta.Stats.NumChunks
 	}
 
 	elapsed := time.Since(downloadBegin)
-	level.Info(jobLogger).Log("msg", "downloaded and verified blocks; compacting blocks", "block_count", blockCount, "blocks", toCompactStr, "total_size_bytes", totalBlockSize, "duration", elapsed, "duration_ms", elapsed.Milliseconds())
+	level.Info(jobLogger).Log(
+		"msg", "downloaded and verified blocks; compacting blocks",
+		"block_count", blockCount,
+		"blocks", toCompactStr,
+		"total_size_bytes", totalBlockSize,
+		"total_samples", totalSamples,
+		"total_series", totalSeries,
+		"total_chunks", totalChunks,
+		"duration", elapsed,
+		"duration_ms", elapsed.Milliseconds(),
+	)
 
 	compactionBegin := time.Now()
 
@@ -434,19 +449,16 @@ func (c *BucketCompactor) runCompactionJob(ctx context.Context, job *Job) (shoul
 		return false, nil, err
 	}
 
-	// Optionally build sparse-index-headers. Building sparse-index-headers is best effort, we do not skip uploading a
+	// Building sparse-index-headers is best-effort, we do not skip uploading a
 	// compacted block if there's an error affecting sparse-index-headers.
-	switch c.uploadSparseIndexHeaders {
-	case true:
-		// Create a bucket backed by the local compaction directory, allows calls to prepareSparseIndexHeader to
-		// construct sparse-index-headers without making requests to object storage.
-		fsbkt, err := filesystem.NewBucket(subDir)
-		if err != nil {
-			c.metrics.compactionBlocksBuildSparseHeadersFailed.Add(float64(uploadBlocksCount))
-			level.Warn(jobLogger).Log("msg", "failed to create filesystem bucket, skipping sparse header upload", "err", err)
-			break
-		}
-
+	//
+	// Create a bucket backed by the local compaction directory, allows calls to prepareSparseIndexHeader to
+	// construct sparse-index-headers without making requests to object storage.
+	fsbkt, err := filesystem.NewBucket(subDir)
+	if err != nil {
+		c.metrics.compactionBlocksBuildSparseHeadersFailed.Add(float64(uploadBlocksCount))
+		level.Warn(jobLogger).Log("msg", "failed to create filesystem bucket, skipping sparse header upload", "err", err)
+	} else {
 		// instrument filesystem.Bucket to objstore.InstrumentedBucket
 		fsInstrBkt := objstore.WithNoopInstr(fsbkt)
 		_ = concurrency.ForEachJob(ctx, uploadBlocksCount, c.blockSyncConcurrency, func(ctx context.Context, idx int) error {
@@ -539,6 +551,7 @@ func (c *BucketCompactor) runCompactionJob(ctx context.Context, job *Job) (shoul
 func prepareSparseIndexHeader(ctx context.Context, logger log.Logger, bkt objstore.InstrumentedBucketReader, dir string, id ulid.ULID, sampling int, cfg indexheader.Config) error {
 	// Calling NewStreamBinaryReader reads a block's index and writes a sparse-index-header to disk.
 	mets := indexheader.NewStreamBinaryReaderMetrics(nil)
+	logger = log.With(logger, "id", id)
 	br, err := indexheader.NewStreamBinaryReader(ctx, logger, bkt, dir, id, sampling, mets, cfg)
 	if err != nil {
 		return err
@@ -844,6 +857,7 @@ func NewBucketCompactorMetrics(blocksMarkedForDeletion prometheus.Counter, reg p
 	}
 	bcm.blocksMarkedForNoCompact.WithLabelValues(block.OutOfOrderChunksNoCompactReason).Add(0)
 	bcm.blocksMarkedForNoCompact.WithLabelValues(block.CriticalNoCompactReason).Add(0)
+	bcm.blocksMarkedForNoCompact.WithLabelValues(block.PostingsOffsetTableTooLargeNoCompactReason).Add(0)
 
 	return bcm
 }
@@ -866,7 +880,6 @@ type BucketCompactor struct {
 	bkt                           objstore.Bucket
 	concurrency                   int
 	skipUnhealthyBlocks           bool
-	uploadSparseIndexHeaders      bool
 	sparseIndexHeaderSamplingRate int
 	maxPerBlockUploadConcurrency  int
 	sparseIndexHeaderconfig       indexheader.Config
@@ -895,7 +908,6 @@ func NewBucketCompactor(
 	skipFutureMaxTime bool,
 	blockSyncConcurrency int,
 	metrics *BucketCompactorMetrics,
-	uploadSparseIndexHeaders bool,
 	sparseIndexHeaderSamplingRate int,
 	sparseIndexHeaderconfig indexheader.Config,
 	maxPerBlockUploadConcurrency int,
@@ -924,7 +936,6 @@ func NewBucketCompactor(
 		skipFutureMaxTime:             skipFutureMaxTime,
 		blockSyncConcurrency:          blockSyncConcurrency,
 		metrics:                       metrics,
-		uploadSparseIndexHeaders:      uploadSparseIndexHeaders,
 		sparseIndexHeaderSamplingRate: sparseIndexHeaderSamplingRate,
 		sparseIndexHeaderconfig:       sparseIndexHeaderconfig,
 		maxPerBlockUploadConcurrency:  maxPerBlockUploadConcurrency,
@@ -1002,53 +1013,11 @@ func (c *BucketCompactor) Compact(ctx context.Context, maxCompactionTime time.Du
 					// At this point the compaction has failed.
 					c.metrics.groupCompactionRunsFailed.Inc()
 
-					if ok, issue347Err := isIssue347Error(err); ok {
-						if err := repairIssue347(workCtx, c.logger, c.bkt, c.sy.metrics.blocksMarkedForDeletion, issue347Err); err == nil {
-							mtx.Lock()
-							finishedAllJobs = false
-							mtx.Unlock()
-							continue
-						}
-					}
-					// If the block has an out of order chunk and we have been configured to skip it,
-					// then we can mark the block for no compaction so that the next compaction run
-					// will skip it.
-					if ok, outOfOrderChunksErr := IsOutOfOrderChunkError(err); ok && c.skipUnhealthyBlocks {
-						err := block.MarkForNoCompact(
-							ctx,
-							c.logger,
-							c.bkt,
-							outOfOrderChunksErr.id,
-							block.OutOfOrderChunksNoCompactReason,
-							"OutofOrderChunk: marking block with out-of-order series/chunks as no compact to unblock compaction",
-							c.metrics.blocksMarkedForNoCompact.WithLabelValues(block.OutOfOrderChunksNoCompactReason),
-						)
-						if err == nil {
-							mtx.Lock()
-							finishedAllJobs = false
-							mtx.Unlock()
-							continue
-						}
-					}
-
-					// In case an unhealthy block is found, we mark it for no compaction
-					// to unblock future compaction run.
-					if ok, criticalErr := IsCriticalError(err); ok && c.skipUnhealthyBlocks {
-						err := block.MarkForNoCompact(
-							ctx,
-							c.logger,
-							c.bkt,
-							criticalErr.id,
-							block.CriticalNoCompactReason,
-							"UnhealthyBlock: marking unhealthy block as no compact to unblock compaction",
-							c.metrics.blocksMarkedForNoCompact.WithLabelValues(block.CriticalNoCompactReason),
-						)
-						if err == nil {
-							mtx.Lock()
-							finishedAllJobs = false
-							mtx.Unlock()
-							continue
-						}
+					if handleErr := c.handleKnownCompactionErrors(workCtx, g, err); handleErr == nil {
+						mtx.Lock()
+						finishedAllJobs = false
+						mtx.Unlock()
+						continue
 					}
 
 					errChan <- fmt.Errorf("group %s: %w", g.Key(), err)
@@ -1153,6 +1122,84 @@ func (c *BucketCompactor) Compact(ctx context.Context, maxCompactionTime time.Du
 	}
 	level.Info(c.logger).Log("msg", "compaction iterations done")
 	return nil
+}
+
+// handleKnownCompactionErrors handles errors that have known mitigations such as marking blocks as no-compact.
+// Returns nil if the error was recognized and handled successfully, otherwise returns a non-nil error.
+func (c *BucketCompactor) handleKnownCompactionErrors(ctx context.Context, job *Job, err error) error {
+	if ok, issue347Err := isIssue347Error(err); ok {
+		return repairIssue347(ctx, c.logger, c.bkt, c.sy.metrics.blocksMarkedForDeletion, issue347Err)
+	}
+
+	// If the block has an out of order chunk and we have been configured to skip it,
+	// then we can mark the block for no compaction so that the next compaction run
+	// will skip it.
+	if ok, outOfOrderChunksErr := IsOutOfOrderChunkError(err); ok && c.skipUnhealthyBlocks {
+		return block.MarkForNoCompact(
+			ctx,
+			c.logger,
+			c.bkt,
+			outOfOrderChunksErr.id,
+			block.OutOfOrderChunksNoCompactReason,
+			"OutofOrderChunk: marking block with out-of-order series/chunks as no compact to unblock compaction",
+			c.metrics.blocksMarkedForNoCompact.WithLabelValues(block.OutOfOrderChunksNoCompactReason),
+		)
+	}
+
+	// In case an unhealthy block is found, we mark it for no compaction
+	// to unblock future compaction run.
+	if ok, criticalErr := IsCriticalError(err); ok && c.skipUnhealthyBlocks {
+		return block.MarkForNoCompact(
+			ctx,
+			c.logger,
+			c.bkt,
+			criticalErr.id,
+			block.CriticalNoCompactReason,
+			"UnhealthyBlock: marking unhealthy block as no compact to unblock compaction",
+			c.metrics.blocksMarkedForNoCompact.WithLabelValues(block.CriticalNoCompactReason),
+		)
+	}
+
+	// Handle postings offset table size errors by marking all input blocks as no-compact.
+	// This error indicates the blocks have extremely high label cardinality and cannot be
+	// compacted together without exceeding the 4GB offset table size limit.
+	if errors.Is(err, index.ErrPostingsOffsetTableTooLarge) && c.skipUnhealthyBlocks {
+		blockIDs := job.IDs()
+		level.Warn(c.logger).Log(
+			"msg", "compaction failed due to postings offset table size limit; marking input blocks as no-compact",
+			"groupKey", job.Key(),
+			"block_count", len(blockIDs),
+			"blocks", fmt.Sprintf("%v", blockIDs),
+			"err", err,
+		)
+
+		allMarked := true
+		for _, blockID := range blockIDs {
+			markErr := block.MarkForNoCompact(
+				ctx,
+				c.logger,
+				c.bkt,
+				blockID,
+				block.PostingsOffsetTableTooLargeNoCompactReason,
+				"PostingsOffsetTableTooLarge: marking input block as no compact to unblock compaction",
+				c.metrics.blocksMarkedForNoCompact.WithLabelValues(block.PostingsOffsetTableTooLargeNoCompactReason),
+			)
+			if markErr != nil {
+				level.Error(c.logger).Log(
+					"msg", "failed to mark block as no-compact after postings offset table size error",
+					"block", blockID,
+					"err", markErr,
+				)
+				allMarked = false
+			}
+		}
+		if allMarked {
+			return nil
+		}
+	}
+
+	// Unhandled, returning original err
+	return err
 }
 
 // blockMaxTimeDeltas returns a slice of the difference between now and the MaxTime of each

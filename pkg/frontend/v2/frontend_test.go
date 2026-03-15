@@ -292,12 +292,16 @@ func TestFrontend_Protobuf_HappyPath(t *testing.T) {
 
 	msg, err := resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf := msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[0], msg)
 
 	msg, err = resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf = msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[1], msg)
 
 	// Response stream exhausted.
@@ -397,12 +401,16 @@ func TestFrontend_Protobuf_QuerierResponseReceivedBeforeSchedulerResponse(t *tes
 
 	msg, err := resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf := msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[0], msg)
 
 	msg, err = resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf = msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[1], msg)
 
 	// Response stream exhausted.
@@ -443,13 +451,15 @@ func TestFrontend_Protobuf_ResponseClosedBeforeStreamExhausted(t *testing.T) {
 
 	msg, err := resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf := msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[0], msg)
 	resp.Close() // We expect all goroutines to be cleaned up after this (verified by the VerifyNoLeakTestMain call in TestMain above)
 }
 
 func TestFrontend_Protobuf_ResponseClosedBeforeResponseReceived(t *testing.T) {
-	respChannel := make(chan *ProtobufResponseStream)
+	respChannel := make(chan ResponseStream)
 	defer close(respChannel)
 
 	f, _ := setupFrontend(t, nil, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
@@ -680,7 +690,9 @@ func TestFrontend_Protobuf_RetryEnqueue(t *testing.T) {
 
 	msg, err := resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf := msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[0], msg)
 }
 
@@ -723,18 +735,23 @@ func TestFrontend_Protobuf_ReadingResponseAfterAllMessagesReceived(t *testing.T)
 	ctx := user.InjectOrgID(context.Background(), userID)
 	ctx = querymiddleware.ContextWithParallelismLimiter(ctx, querymiddleware.NewParallelismLimiter(math.MaxInt))
 	req := &querierpb.EvaluateQueryRequest{}
-	resp, err := f.DoProtobufRequest(ctx, req, time.Now(), time.Now())
+	r, err := f.DoProtobufRequest(ctx, req, time.Now(), time.Now())
 	require.NoError(t, err)
-	defer resp.Close()
+	defer r.Close()
+	resp := r.(*ProtobufResponseStream)
 
 	msg, err := resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf := msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[0], msg)
 
 	msg, err = resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf = msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[1], msg)
 
 	// Wait until the last message has been buffered into the stream channel and the stream's context has been cancelled by DoProtobufRequest.
@@ -747,7 +764,9 @@ func TestFrontend_Protobuf_ReadingResponseAfterAllMessagesReceived(t *testing.T)
 
 	msg, err = resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf = msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, expectedMessages[2], msg, "should still be able to read last message after stream has been completely read")
 
 	msg, err = resp.Next(ctx)
@@ -1302,12 +1321,16 @@ func TestFrontend_Protobuf_ResponseSentTwice(t *testing.T) {
 
 	msg, err := resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf := msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, firstMessage, msg)
 
 	msg, err = resp.Next(ctx)
 	require.NoError(t, err)
-	msg.FreeBuffer() // We don't care about the contents of the buffer in the assertion below.
+	buf = msg.Buffer()
+	defer buf.Free()
+	msg.SetBuffer(nil) // We don't care about the contents of the buffer in the assertion below.
 	require.Equal(t, secondMessage, msg)
 
 	// Response stream exhausted.
@@ -1426,7 +1449,7 @@ func generateConcurrencyTestResponse(idx uint64) *frontendv2pb.QueryResultStream
 		series = append(series, labels.FromStrings(lbls...))
 	}
 
-	return newSeriesMetadata(false, series...)
+	return newSeriesMetadata(0, false, series...)
 }
 
 func TestFrontendStreamingResponse(t *testing.T) {

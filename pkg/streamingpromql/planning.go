@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Provenance-includes-location: https://github.com/prometheus/prometheus/blob/main/promql/functions.go
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Prometheus Authors
 
 package streamingpromql
 
@@ -26,9 +29,13 @@ import (
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/ast"
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan"
 	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan/commonsubexpressionelimination"
+	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan/multiaggregation"
+	"github.com/grafana/mimir/pkg/streamingpromql/optimize/plan/rangevectorsplitting"
 	"github.com/grafana/mimir/pkg/streamingpromql/planning"
 	"github.com/grafana/mimir/pkg/streamingpromql/planning/core"
+	planningmetrics "github.com/grafana/mimir/pkg/streamingpromql/planning/metrics"
 	"github.com/grafana/mimir/pkg/streamingpromql/types"
+	"github.com/grafana/mimir/pkg/util/promqlext"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 )
 
@@ -56,14 +63,14 @@ func (e ErrSmoothedIncompatibleFunction) Error() string {
 type QueryPlanner struct {
 	activeQueryTracker       QueryTracker
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
-	enableDelayedNameRemoval bool
 	astOptimizationPasses    []optimize.ASTOptimizationPass
 	planOptimizationPasses   []optimize.QueryPlanOptimizationPass
 	planStageLatency         *prometheus.HistogramVec
 	generatedPlans           *prometheus.CounterVec
 	versionProvider          QueryPlanVersionProvider
-
-	logger log.Logger
+	planningMetricsTracker   *planningmetrics.MetricsTracker
+	logger                   log.Logger
+	parser                   parser.Parser
 
 	// Replaced during testing to ensure timing produces consistent results.
 	TimeSince func(time.Time) time.Duration
@@ -79,14 +86,18 @@ func NewQueryPlanner(opts EngineOpts, versionProvider QueryPlanVersionProvider) 
 	// we introduce query-frontend-specific optimization passes like sharding and splitting for two reasons:
 	//  1. We want to avoid a circular dependency between this package and the query-frontend package where most of the logic for these optimization passes lives.
 	//  2. We don't want to register these optimization passes in queriers.
-	planner.RegisterASTOptimizationPass(&ast.CollapseConstants{}) // We expect this to be the first to simplify the logic for the rest of the optimization passes.
+	planner.RegisterASTOptimizationPass(&ast.InsertOmittedTargetInfoSelector{}) // We apply this first so that all other optimization passes can safely assume that info functions have exactly 2 arguments.
+	planner.RegisterASTOptimizationPass(&ast.CollapseConstants{})               // We expect this to be applied early to simplify the logic for the rest of the optimization passes.
+
 	if opts.EnablePruneToggles {
 		planner.RegisterASTOptimizationPass(ast.NewPruneToggles(opts.CommonOpts.Reg)) // Do this next to ensure that toggled off expressions are removed before the other optimization passes are applied.
 	}
+
 	// NOTE: This optimization pass MUST run before SortLabelsAndMatchers since it does not preserve the order of matchers.
 	if opts.EnableReduceMatchers {
 		planner.RegisterASTOptimizationPass(ast.NewReduceMatchers(opts.CommonOpts.Reg, opts.Logger))
 	}
+
 	planner.RegisterASTOptimizationPass(&ast.SortLabelsAndMatchers{}) // This is a prerequisite for other optimization passes such as common subexpression elimination.
 	// After query sharding is moved here, we want to move propagate matchers and reorder histogram aggregation here as well before query sharding.
 
@@ -94,16 +105,36 @@ func NewQueryPlanner(opts EngineOpts, versionProvider QueryPlanVersionProvider) 
 	// After CSE, the query plan may no longer be a tree due to multiple paths culminating in the same Duplicate node,
 	// which would make the elimination logic more complex.
 	if opts.EnableEliminateDeduplicateAndMerge {
-		planner.RegisterQueryPlanOptimizationPass(plan.NewEliminateDeduplicateAndMergeOptimizationPass(opts.CommonOpts.EnableDelayedNameRemoval))
+		planner.RegisterQueryPlanOptimizationPass(plan.NewEliminateDeduplicateAndMergeOptimizationPass(opts.CommonOpts.Reg, opts.Logger))
 	}
 
-	if opts.EnableSkippingHistogramDecoding {
+	// This optimization pass must be registered before common subexpression elimination, if that is enabled.
+	planner.RegisterQueryPlanOptimizationPass(plan.NewSkipHistogramDecodingOptimizationPass())
+
+	if opts.EnableProjectionPushdown {
 		// This optimization pass must be registered before common subexpression elimination, if that is enabled.
-		planner.RegisterQueryPlanOptimizationPass(plan.NewSkipHistogramDecodingOptimizationPass())
+		planner.RegisterQueryPlanOptimizationPass(plan.NewProjectionPushdownOptimizationPass(opts.CommonOpts.Reg, opts.Logger))
+	}
+
+	// Run range vector splitting pass before CSE.
+	if opts.RangeVectorSplitting.Enabled {
+		splitInterval := opts.RangeVectorSplitting.SplitInterval
+		if splitInterval <= 0 {
+			return nil, errors.New("range vector splitting is enabled but split interval is not greater than 0")
+		}
+		planner.RegisterQueryPlanOptimizationPass(rangevectorsplitting.NewOptimizationPass(splitInterval, opts.Limits, time.Now, opts.CommonOpts.Reg, opts.Logger))
 	}
 
 	if opts.EnableCommonSubexpressionElimination {
-		planner.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(opts.EnableCommonSubexpressionEliminationForRangeVectorExpressionsInInstantQueries, opts.CommonOpts.Reg, opts.Logger))
+		planner.RegisterQueryPlanOptimizationPass(commonsubexpressionelimination.NewOptimizationPass(opts.CommonOpts.Reg, opts.Logger))
+	}
+
+	if opts.EnableMultiAggregation {
+		if !opts.EnableCommonSubexpressionElimination {
+			return nil, errors.New("cannot enable multi-aggregation without common subexpression elimination")
+		}
+
+		planner.RegisterQueryPlanOptimizationPass(multiaggregation.NewOptimizationPass(opts.CommonOpts.Reg))
 	}
 
 	if opts.EnableNarrowBinarySelectors {
@@ -126,10 +157,14 @@ func NewQueryPlannerWithoutOptimizationPasses(opts EngineOpts, versionProvider Q
 		activeQueryTracker = &NoopQueryTracker{}
 	}
 
+	promqlParser := opts.CommonOpts.Parser
+	if promqlParser == nil {
+		promqlParser = promqlext.NewPromQLParser()
+	}
+
 	return &QueryPlanner{
 		activeQueryTracker:       activeQueryTracker,
 		noStepSubqueryIntervalFn: opts.CommonOpts.NoStepSubqueryIntervalFn,
-		enableDelayedNameRemoval: opts.CommonOpts.EnableDelayedNameRemoval,
 		planStageLatency: promauto.With(opts.CommonOpts.Reg).NewHistogramVec(prometheus.HistogramOpts{
 			Name:                        "cortex_mimir_query_engine_plan_stage_latency_seconds",
 			Help:                        "Latency of each stage of the query planning process.",
@@ -139,8 +174,9 @@ func NewQueryPlannerWithoutOptimizationPasses(opts EngineOpts, versionProvider Q
 			Name: "cortex_mimir_query_engine_plans_generated_total",
 			Help: "Total number of query plans generated.",
 		}, []string{"version"}),
-
-		versionProvider: versionProvider,
+		planningMetricsTracker: planningmetrics.NewMetricsTracker(opts.CommonOpts.Reg),
+		versionProvider:        versionProvider,
+		parser:                 promqlParser,
 
 		logger:    opts.Logger,
 		TimeSince: time.Since,
@@ -172,7 +208,7 @@ type PlanningObserver interface {
 // an expression and any error encountered. This is separated into its own method to allow testing of
 // AST optimization passes.
 func (p *QueryPlanner) ParseAndApplyASTOptimizationPasses(ctx context.Context, qs string, timeRange types.QueryTimeRange, observer PlanningObserver) (parser.Expr, error) {
-	expr, err := p.runASTStage("Parsing", observer, func() (parser.Expr, error) { return parser.ParseExpr(qs) })
+	expr, err := p.runASTStage("Parsing", observer, func() (parser.Expr, error) { return p.parser.ParseExpr(qs) })
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +249,7 @@ func (p *QueryPlanner) ParseAndApplyASTOptimizationPasses(ctx context.Context, q
 	return expr, nil
 }
 
-func (p *QueryPlanner) NewQueryPlan(ctx context.Context, qs string, timeRange types.QueryTimeRange, observer PlanningObserver) (*planning.QueryPlan, error) {
+func (p *QueryPlanner) NewQueryPlan(ctx context.Context, qs string, timeRange types.QueryTimeRange, enableDelayedNameRemoval bool, observer PlanningObserver) (*planning.QueryPlan, error) {
 	spanLogger, ctx := spanlogger.New(ctx, p.logger, tracer, "QueryPlanner.NewQueryPlan")
 	defer spanLogger.Finish()
 	spanLogger.SetTag("query", qs)
@@ -240,12 +276,12 @@ func (p *QueryPlanner) NewQueryPlan(ctx context.Context, qs string, timeRange ty
 	spanLogger.DebugLog("msg", "AST optimisation passes completed", "expression", expr)
 
 	plan, err := p.runPlanningStage("Original plan", observer, func() (*planning.QueryPlan, error) {
-		root, err := p.nodeFromExpr(expr)
+		root, err := p.nodeFromExpr(expr, timeRange)
 		if err != nil {
 			return nil, err
 		}
 
-		if p.enableDelayedNameRemoval {
+		if enableDelayedNameRemoval {
 			var err error
 			root, err = p.insertDropNameOperator(root)
 			if err != nil {
@@ -258,7 +294,7 @@ func (p *QueryPlanner) NewQueryPlan(ctx context.Context, qs string, timeRange ty
 			Parameters: &planning.QueryParameters{
 				TimeRange:                timeRange,
 				OriginalExpression:       qs,
-				EnableDelayedNameRemoval: p.enableDelayedNameRemoval,
+				EnableDelayedNameRemoval: enableDelayedNameRemoval,
 			},
 		}
 
@@ -393,7 +429,7 @@ func (p *QueryPlanner) runPlanningStage(stageName string, observer PlanningObser
 	return plan, nil
 }
 
-func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
+func (p *QueryPlanner) nodeFromExpr(expr parser.Expr, timeRange types.QueryTimeRange) (planning.Node, error) {
 	switch expr := expr.(type) {
 	case *parser.VectorSelector:
 		return &core.VectorSelector{
@@ -430,7 +466,7 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 		}, nil
 
 	case *parser.AggregateExpr:
-		inner, err := p.nodeFromExpr(expr.Expr)
+		inner, err := p.nodeFromExpr(expr.Expr, timeRange)
 		if err != nil {
 			return nil, err
 		}
@@ -438,7 +474,7 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 		var param planning.Node
 
 		if expr.Param != nil {
-			param, err = p.nodeFromExpr(expr.Param)
+			param, err = p.nodeFromExpr(expr.Param, timeRange)
 			if err != nil {
 				return nil, err
 			}
@@ -461,12 +497,16 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 		}, nil
 
 	case *parser.BinaryExpr:
-		lhs, err := p.nodeFromExpr(expr.LHS)
+		if expr.VectorMatching != nil && (expr.VectorMatching.FillValues.RHS != nil || expr.VectorMatching.FillValues.LHS != nil) {
+			return nil, compat.NewNotSupportedError("'fill' modifier")
+		}
+
+		lhs, err := p.nodeFromExpr(expr.LHS, timeRange)
 		if err != nil {
 			return nil, err
 		}
 
-		rhs, err := p.nodeFromExpr(expr.RHS)
+		rhs, err := p.nodeFromExpr(expr.RHS, timeRange)
 		if err != nil {
 			return nil, err
 		}
@@ -525,7 +565,7 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 		args := make([]planning.Node, 0, len(expr.Args))
 
 		for _, arg := range expr.Args {
-			node, err := p.nodeFromExpr(arg)
+			node, err := p.nodeFromExpr(arg, timeRange)
 			if err != nil {
 				return nil, err
 			}
@@ -541,6 +581,10 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 				if !supported {
 					return nil, ErrSmoothedIncompatibleFunction{functionName: expr.Func.Name}
 				}
+				// We only need to calculate the counter-aware interpolated smoothed points if the outer function is rate or increase.
+				// The delta function does not require the counter adjusted points.
+				// See Prometheus function.go - funcDelta(), funcRate(), funcIncrease() - only rate and increase set isCounter=true
+				matrixSelector.CounterAware = expr.Func.Name == "rate" || expr.Func.Name == "increase"
 			}
 
 			args = append(args, node)
@@ -569,6 +613,10 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 				if ok {
 					vectorSelector.ReturnSampleTimestamps = true
 					f.Args[0] = stepInvariantExpression.Inner
+
+					// Note - we do not update the step invariant metrics tracker as this will already have been updated when the
+					// argument expression was created.
+
 					return &core.StepInvariantExpression{
 						Inner: &core.DeduplicateAndMerge{
 							Inner:                      f,
@@ -582,6 +630,17 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 			if ok {
 				vectorSelector.ReturnSampleTimestamps = true
 			}
+		case functions.FUNCTION_INFO:
+			// The InsertOmittedTargetInfoSelector AST pass ensures there are always 2 arguments.
+			// Check len(args) == 2 for safety in case the pass doesn't run (e.g., in tests).
+			if len(args) == 2 {
+				vectorSelector, ok := args[1].(*core.VectorSelector)
+				if !ok {
+					return nil, fmt.Errorf("expected second argument of info() to be a VectorSelector, got %T", args[1])
+				}
+				// Override float values to reflect original timestamps.
+				vectorSelector.ReturnSampleTimestampsPreserveHistograms = true
+			}
 		}
 
 		if functionNeedsDeduplication(fnc) {
@@ -594,10 +653,6 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 		return f, nil
 
 	case *parser.SubqueryExpr:
-		inner, err := p.nodeFromExpr(expr.Expr)
-		if err != nil {
-			return nil, err
-		}
 
 		step := expr.Step
 
@@ -605,8 +660,12 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 			step = time.Duration(p.noStepSubqueryIntervalFn(expr.Range.Milliseconds())) * time.Millisecond
 		}
 
-		return &core.Subquery{
-			Inner: inner,
+		// Construct the Subquery in 2 phases.
+		// The first step initializes the SubqueryDetails, which allows us to determine the children time range.
+		// The second step then creates the inner expression, passing in this child time range.
+		// This is needed by the step invariant expression handler which will require this child time range to
+		// accurately calculate the number of steps saved.
+		subquery := &core.Subquery{
 			SubqueryDetails: &core.SubqueryDetails{
 				Timestamp:          core.TimeFromTimestamp(expr.Timestamp),
 				Offset:             expr.OriginalOffset,
@@ -614,10 +673,20 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 				Step:               step,
 				ExpressionPosition: core.PositionRangeFrom(expr.PositionRange()),
 			},
-		}, nil
+		}
+
+		childTimeRange := subquery.ChildrenTimeRange(timeRange)
+
+		inner, err := p.nodeFromExpr(expr.Expr, childTimeRange)
+		if err != nil {
+			return nil, err
+		}
+
+		subquery.Inner = inner
+		return subquery, nil
 
 	case *parser.UnaryExpr:
-		inner, err := p.nodeFromExpr(expr.Expr)
+		inner, err := p.nodeFromExpr(expr.Expr, timeRange)
 		if err != nil {
 			return nil, err
 		}
@@ -667,13 +736,20 @@ func (p *QueryPlanner) nodeFromExpr(expr parser.Expr) (planning.Node, error) {
 		}, nil
 
 	case *parser.ParenExpr:
-		return p.nodeFromExpr(expr.Expr)
+		return p.nodeFromExpr(expr.Expr, timeRange)
 
 	case *parser.StepInvariantExpr:
-		inner, err := p.nodeFromExpr(expr.Expr)
+		inner, err := p.nodeFromExpr(expr.Expr, timeRange)
 		if err != nil {
 			return nil, err
 		}
+
+		// There is no advantage to wrapping an instant query in a step invariant.
+		if timeRange.StepCount <= 1 {
+			return inner, nil
+		}
+
+		p.planningMetricsTracker.StepInvariantTracker.OnStepInvariantExpressionAdded(timeRange.StepCount)
 
 		return &core.StepInvariantExpression{
 			Inner:                          inner,
@@ -790,8 +866,6 @@ func functionNeedsDeduplication(fnc functions.Function) bool {
 		functions.FUNCTION_FIRST_OVER_TIME,
 		functions.FUNCTION_INFO,
 		functions.FUNCTION_LAST_OVER_TIME,
-		functions.FUNCTION_LIMITK,
-		functions.FUNCTION_LIMIT_RATIO,
 		functions.FUNCTION_PI,
 		functions.FUNCTION_SCALAR,
 		functions.FUNCTION_SHARDING_CONCAT, // Might return duplicate series, but this is OK and desired, and aggregation operators will handle this correctly.

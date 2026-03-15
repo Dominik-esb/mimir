@@ -58,13 +58,14 @@ import (
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/storage/bucket"
+	"github.com/grafana/mimir/pkg/storage/fixtures"
 	"github.com/grafana/mimir/pkg/storage/indexheader"
 	"github.com/grafana/mimir/pkg/storage/indexheader/index"
 	"github.com/grafana/mimir/pkg/storage/sharding"
 	mimir_tsdb "github.com/grafana/mimir/pkg/storage/tsdb"
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
+	"github.com/grafana/mimir/pkg/storage/tsdb/indexcache"
 	"github.com/grafana/mimir/pkg/storegateway/hintspb"
-	"github.com/grafana/mimir/pkg/storegateway/indexcache"
 	"github.com/grafana/mimir/pkg/storegateway/storepb"
 	"github.com/grafana/mimir/pkg/util/pool"
 	"github.com/grafana/mimir/pkg/util/test"
@@ -313,7 +314,10 @@ func TestBlockLabelNames(t *testing.T) {
 	sl := NewLimiter(math.MaxUint64, promauto.With(nil).NewCounter(prometheus.CounterOpts{Name: "test"}), func(limit uint64) validation.LimitError {
 		return validation.NewLimitError(fmt.Sprintf("exceeded unlimited limit of %v", limit))
 	})
-	newTestBucketBlock := prepareTestBlock(test.NewTB(t), appendTestSeries(series))
+
+	tb := test.NewTB(t)
+	testBlock := fixtures.SetupTestBlock(tb, fixtures.AppendTestSeries(series))
+	newTestBucketBlock := testBlockToBucketBlock(tb, testBlock)
 
 	t.Run("happy case with no matchers", func(t *testing.T) {
 		b := newTestBucketBlock()
@@ -420,7 +424,9 @@ func (c cacheNotExpectingToStoreLabelNames) StoreLabelNames(string, ulid.ULID, i
 func TestBlockLabelValues(t *testing.T) {
 	const series = 100_000
 
-	newTestBucketBlock := prepareTestBlock(test.NewTB(t), appendTestSeries(series))
+	tb := test.NewTB(t)
+	testBlock := fixtures.SetupTestBlock(tb, fixtures.AppendTestSeries(series))
+	newTestBucketBlock := testBlockToBucketBlock(tb, testBlock)
 
 	t.Run("happy case with no matchers", func(t *testing.T) {
 		b := newTestBucketBlock()
@@ -578,7 +584,8 @@ func TestBucketIndexReader_ExpandedPostings(t *testing.T) {
 	tb := test.NewTB(t)
 	const series = 50000
 
-	newTestBucketBlock := prepareTestBlock(tb, appendTestSeries(series))
+	testBlock := fixtures.SetupTestBlock(tb, fixtures.AppendTestSeries(series))
+	newTestBucketBlock := testBlockToBucketBlock(tb, testBlock)
 
 	t.Run("happy cases", func(t *testing.T) {
 		benchmarkExpandedPostings(test.NewTB(t), newTestBucketBlock, series)
@@ -914,7 +921,13 @@ func TestBucketIndexReader_ExpandedPostings(t *testing.T) {
 }
 
 func newInMemoryIndexCache(t testing.TB) indexcache.IndexCache {
-	cache, err := indexcache.NewInMemoryIndexCacheWithConfig(log.NewNopLogger(), nil, indexcache.DefaultInMemoryIndexCacheConfig)
+	cache, err := indexcache.NewInMemoryIndexCacheWithConfig(
+		indexcache.InMemoryIndexCacheConfig{
+			MaxCacheSizeBytes: 250 * 1024 * 1024,
+			MaxItemSizeBytes:  125 * 1024 * 1024,
+		},
+		nil, log.NewNopLogger(),
+	)
 	require.NoError(t, err)
 	return cache
 }
@@ -1040,54 +1053,46 @@ func BenchmarkBucketIndexReader_ExpandedPostings(b *testing.B) {
 	tb := test.NewTB(b)
 	const series = 50e5
 
-	newTestBucketBlock := prepareTestBlock(tb, appendTestSeries(series))
+	testBlock := fixtures.SetupTestBlock(tb, fixtures.AppendTestSeries(series))
+	newTestBucketBlock := testBlockToBucketBlock(tb, testBlock)
 	benchmarkExpandedPostings(test.NewTB(b), newTestBucketBlock, series)
 }
 
-func prepareTestBlock(tb test.TB, dataSetup ...testBlockDataSetup) func() *bucketBlock {
-	tmpDir := tb.TempDir()
-	bucketDir := filepath.Join(tmpDir, "bkt")
-
-	ubkt, err := filesystem.NewBucket(bucketDir)
-	assert.NoError(tb, err)
-
-	bkt := objstore.WithNoopInstr(ubkt)
-
-	tb.Cleanup(func() {
-		assert.NoError(tb, ubkt.Close())
-		assert.NoError(tb, bkt.Close())
-	})
-
-	id, minT, maxT := uploadTestBlock(tb, tmpDir, bkt, dataSetup)
-
-	r, err := indexheader.NewStreamBinaryReader(context.Background(), log.NewNopLogger(), bkt, tmpDir, id, mimir_tsdb.DefaultPostingOffsetInMemorySampling, indexheader.NewStreamBinaryReaderMetrics(nil), indexheader.Config{})
-	require.NoError(tb, err)
-
+func testBlockToBucketBlock(tb testing.TB, testBlock *fixtures.BucketTestBlock) func() *bucketBlock {
 	return func() *bucketBlock {
 		var chunkObjects []string
-		err := bkt.Iter(context.Background(), path.Join(id.String(), "chunks"), func(s string) error {
-			chunkObjects = append(chunkObjects, s)
-			return nil
-		})
+		err := testBlock.InstrBkt.Iter(
+			context.Background(),
+			path.Join(testBlock.Meta.ULID.String(), "chunks"), func(s string) error {
+				chunkObjects = append(chunkObjects, s)
+				return nil
+			})
+		require.NoError(tb, err)
+
+		indexReader, err := indexheader.NewStreamBinaryReader(
+			context.Background(),
+			log.NewNopLogger(),
+			testBlock.InstrBkt,
+			tb.TempDir(),
+			testBlock.Meta.ULID,
+			mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			indexheader.NewStreamBinaryReaderMetrics(nil),
+			indexheader.Config{},
+		)
 		require.NoError(tb, err)
 
 		return &bucketBlock{
 			userID:            "tenant",
 			logger:            log.NewNopLogger(),
 			metrics:           NewBucketStoreMetrics(nil),
-			indexHeaderReader: r,
+			indexHeaderReader: indexReader,
 			indexCache:        noopCache{},
 			chunkObjs:         chunkObjects,
-			bkt:               localBucket{Bucket: ubkt, dir: bucketDir},
-			meta:              &block.Meta{BlockMeta: tsdb.BlockMeta{ULID: id, MinTime: minT, MaxTime: maxT}},
+			bkt:               testBlock.InstrBkt,
+			meta:              testBlock.Meta,
 			partitioners:      newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
 		}
 	}
-}
-
-type localBucket struct {
-	*filesystem.Bucket
-	dir string
 }
 
 type testBlockDataSetup = func(tb testing.TB, appenderFactory func() storage.Appender)
@@ -1181,8 +1186,8 @@ func benchmarkExpandedPostings(
 	ctx, cancel := context.WithCancel(context.Background())
 	tb.Cleanup(cancel)
 
-	for _, testCase := range seriesSelectionTestCases(tb, series) {
-		tb.Run(testCase.name, func(tb test.TB) {
+	for _, testCase := range fixtures.SeriesSelectorTestCases(tb, series) {
+		tb.Run(testCase.Name, func(tb test.TB) {
 			indexr := newBucketIndexReader(newTestBucketBlock(), selectAllStrategy{})
 
 			var allSeries []labels.Labels
@@ -1196,11 +1201,11 @@ func benchmarkExpandedPostings(
 
 			tb.ResetTimer()
 			for i := 0; i < tb.N(); i++ {
-				p, _, err := indexr.ExpandedPostings(ctx, testCase.matchers, indexrStats)
+				p, _, err := indexr.ExpandedPostings(ctx, testCase.Matchers, indexrStats)
 				assert.NoError(tb, err)
-				assert.Equal(tb, testCase.expectedSeriesLen, len(p))
+				assert.Equal(tb, testCase.ExpectedCount, len(p))
 				if !tb.IsBenchmark() {
-					seriesThatMatch := filterSeries(allSeries, testCase.matchers)
+					seriesThatMatch := filterSeries(allSeries, testCase.Matchers)
 					seriesForPostings := loadSeries(ctx, tb, p, indexr)
 					testutil.RequireEqual(tb, seriesThatMatch, seriesForPostings)
 				}
@@ -1252,101 +1257,6 @@ func loadSeries(ctx context.Context, tb test.TB, postings []storage.SeriesRef, i
 	}
 	require.NoError(tb, seriesIterator.Err())
 	return series
-}
-
-type seriesSelectionTestCase struct {
-	name              string
-	matchers          []*labels.Matcher
-	expectedSeriesLen int
-}
-
-// Very similar benchmark to ths: https://github.com/prometheus/prometheus/blob/1d1732bc25cc4b47f513cb98009a4eb91879f175/tsdb/querier_bench_test.go#L82,
-func seriesSelectionTestCases(
-	t test.TB,
-	series int,
-) []seriesSelectionTestCase {
-	series = series / 5
-
-	iUniqueValues := series / 10      // The amount of unique values for "i" label prefix. See appendTestSeries.
-	iUniqueValue := iUniqueValues / 2 // There will be 50 series matching: 5 per each series, 10 for each n. See appendTestSeries.
-
-	n1 := labels.MustNewMatcher(labels.MatchEqual, "n", "1"+labelLongSuffix)
-	nX := labels.MustNewMatcher(labels.MatchEqual, "n", "X"+labelLongSuffix)
-	nAnyPlus := labels.MustNewMatcher(labels.MatchRegexp, "n", ".+")
-	nAnyStar := labels.MustNewMatcher(labels.MatchRegexp, "n", ".*")
-
-	jFoo := labels.MustNewMatcher(labels.MatchEqual, "j", "foo")
-	jNotFoo := labels.MustNewMatcher(labels.MatchNotEqual, "j", "foo")
-	jAnyStar := labels.MustNewMatcher(labels.MatchRegexp, "j", ".*")
-	jAnyPlus := labels.MustNewMatcher(labels.MatchRegexp, "j", ".+")
-
-	iStar := labels.MustNewMatcher(labels.MatchRegexp, "i", "^.*$")
-	iPlus := labels.MustNewMatcher(labels.MatchRegexp, "i", "^.+$")
-	i1Plus := labels.MustNewMatcher(labels.MatchRegexp, "i", "^1.+$")
-	iUniquePrefixPlus := labels.MustNewMatcher(labels.MatchRegexp, "i", fmt.Sprintf("%d.+", iUniqueValue))
-	iNotUniquePrefixPlus := labels.MustNewMatcher(labels.MatchNotRegexp, "i", fmt.Sprintf("%d.+", iUniqueValue))
-	iEmptyRe := labels.MustNewMatcher(labels.MatchRegexp, "i", "^$")
-	iNotEmpty := labels.MustNewMatcher(labels.MatchNotEqual, "i", "")
-	iNot2 := labels.MustNewMatcher(labels.MatchNotEqual, "n", "2"+labelLongSuffix)
-	iNot2Star := labels.MustNewMatcher(labels.MatchNotRegexp, "i", "^2.*$")
-	iNotStar2Star := labels.MustNewMatcher(labels.MatchNotRegexp, "i", "^.*2.*$")
-	jXXXYYY := labels.MustNewMatcher(labels.MatchRegexp, "j", "XXX|YYY")
-	jXplus := labels.MustNewMatcher(labels.MatchRegexp, "j", "X.+")
-	iRegexAlternate := labels.MustNewMatcher(labels.MatchRegexp, "i", "0"+labelLongSuffix+"|1"+labelLongSuffix+"|2"+labelLongSuffix)
-	iXYZ := labels.MustNewMatcher(labels.MatchRegexp, "i", "X|Y|Z")
-	iRegexAlternateSuffix := labels.MustNewMatcher(labels.MatchRegexp, "i", "(0|1|2)"+labelLongSuffix)
-	iRegexClass := labels.MustNewMatcher(labels.MatchRegexp, "i", "[0-2]"+labelLongSuffix)
-	iRegexNotSetMatches := labels.MustNewMatcher(labels.MatchNotRegexp, "i", "(0|1|2)"+labelLongSuffix)
-	pNotEmpty := labels.MustNewMatcher(labels.MatchNotEqual, "p", "")
-	pFoo := labels.MustNewMatcher(labels.MatchEqual, "p", "foo")
-
-	// Just make sure that we're testing what we think we're testing.
-	require.NotEmpty(t, iRegexNotSetMatches.SetMatches(), "Should have non empty SetMatches to test the proper path.")
-
-	return []seriesSelectionTestCase{
-		{`n="X"`, []*labels.Matcher{nX}, 0},
-		{`n="X",j="foo"`, []*labels.Matcher{nX, jFoo}, 0},
-		{`n="X",j!="foo"`, []*labels.Matcher{nX, jNotFoo}, 0},
-		{`j=~"XXX|YYY"`, []*labels.Matcher{jXXXYYY}, 0},
-		{`j=~"X.+"`, []*labels.Matcher{jXplus}, 0},
-		{`i=~"X|Y|Z"`, []*labels.Matcher{iXYZ}, 0},
-		{`n="1"`, []*labels.Matcher{n1}, int(float64(series) * 0.2)},
-		{`n="1",j="foo"`, []*labels.Matcher{n1, jFoo}, int(float64(series) * 0.1)},
-		{`j="foo",n="1"`, []*labels.Matcher{jFoo, n1}, int(float64(series) * 0.1)},
-		{`n="1",j!="foo"`, []*labels.Matcher{n1, jNotFoo}, int(float64(series) * 0.1)},
-		{`i=~".*"`, []*labels.Matcher{iStar}, 5 * series},
-		{`i=~".+"`, []*labels.Matcher{iPlus}, 5 * series},
-		{`i=~"^.+$",j=~"X.+"`, []*labels.Matcher{iPlus, jXplus}, 0},
-		{`i=~""`, []*labels.Matcher{iEmptyRe}, 0},
-		{`i!=""`, []*labels.Matcher{iNotEmpty}, 5 * series},
-		{`n="1",i=~".*",j="foo"`, []*labels.Matcher{n1, iStar, jFoo}, int(float64(series) * 0.1)},
-		{`n="X",i=~"^.+$",j="foo"`, []*labels.Matcher{nX, iStar, jFoo}, 0},
-		{`n="1",i=~".*",i!="2",j="foo"`, []*labels.Matcher{n1, iStar, iNot2, jFoo}, int(float64(series) * 0.1)},
-		{`n="1",i!=""`, []*labels.Matcher{n1, iNotEmpty}, int(float64(series) * 0.2)},
-		{`n="1",i!="",j="foo"`, []*labels.Matcher{n1, iNotEmpty, jFoo}, int(float64(series) * 0.1)},
-		{`n="1",i!="",j=~"X.+"`, []*labels.Matcher{n1, iNotEmpty, jXplus}, 0},
-		{`n="1",i!="",j=~"XXX|YYY"`, []*labels.Matcher{n1, iNotEmpty, jXXXYYY}, 0},
-		{`n="1",i=~"X|Y|Z",j="foo"`, []*labels.Matcher{n1, iXYZ, jFoo}, 0},
-		{`n="1",i=~".+",j="foo"`, []*labels.Matcher{n1, iPlus, jFoo}, int(float64(series) * 0.1)},
-		{`n="1",i=~"1.+",j="foo"`, []*labels.Matcher{n1, i1Plus, jFoo}, int(float64(series) * 0.011111)},
-		{`n="1",i=~".+",i!="2",j="foo"`, []*labels.Matcher{n1, iPlus, iNot2, jFoo}, int(float64(series) * 0.1)},
-		{`n="1",i=~".+",i!~"2.*",j="foo"`, []*labels.Matcher{n1, iPlus, iNot2Star, jFoo}, int(1 + float64(series)*0.088888)},
-		{`n="X",i=~"^.+$",i!~"^.*2.*$",j="foo"`, []*labels.Matcher{nX, iPlus, iNotStar2Star, jFoo}, 0},
-		{`i=~"0xxx|1xxx|2xxx"`, []*labels.Matcher{iRegexAlternate}, 150},                        // 50 series for "1", 50 for "2" and 50 for "3".
-		{`i=~"(0|1|2)xxx"`, []*labels.Matcher{iRegexAlternateSuffix}, 150},                      // 50 series for "1", 50 for "2" and 50 for "3".
-		{`i=~"[0-2]xxx"`, []*labels.Matcher{iRegexClass}, 150},                                  // 50 series for "1", 50 for "2" and 50 for "3".
-		{`i!~[0-2]xxx`, []*labels.Matcher{iRegexNotSetMatches}, 5*series - 150},                 // inverse of iRegexAlternateSuffix
-		{`i=~".*", i!~[0-2]xxx`, []*labels.Matcher{iStar, iRegexNotSetMatches}, 5*series - 150}, // inverse of iRegexAlternateSuffix
-		{`i=~"<unique_prefix>.+"`, []*labels.Matcher{iUniquePrefixPlus}, 50},
-		{`n="1",i=~"<unique_prefix>.+"`, []*labels.Matcher{n1, iUniquePrefixPlus}, 2},
-		{`n="1",i!~"<unique_prefix>.+"`, []*labels.Matcher{n1, iNotUniquePrefixPlus}, int(float64(series)*0.2) - 2},
-		{`j="foo",p="foo",i=~"<unique_prefix>.+"`, []*labels.Matcher{jFoo, pFoo, iUniquePrefixPlus}, 10},
-		{`j="foo",n=~".+",i=~"<unique_prefix>.+"`, []*labels.Matcher{jFoo, nAnyPlus, iUniquePrefixPlus}, 20},
-		{`j="foo",n=~".*",i=~"<unique_prefix>.+"`, []*labels.Matcher{jFoo, nAnyStar, iUniquePrefixPlus}, 20},
-		{`j=~".*",n=~".*",i=~"<unique_prefix>.+"`, []*labels.Matcher{jAnyStar, nAnyStar, iUniquePrefixPlus}, 50},
-		{`j=~".+",n=~".+",i=~"<unique_prefix>.+"`, []*labels.Matcher{jAnyPlus, nAnyPlus, iUniquePrefixPlus}, 50},
-		{`p!=""`, []*labels.Matcher{pNotEmpty}, series},
-	}
 }
 
 func TestBucketStore_Series(t *testing.T) {
@@ -1552,6 +1462,7 @@ func benchBucketSeries(t test.TB, skipChunk bool, samplesPerSeries, totalSeries 
 		st, err := NewBucketStore(
 			"test",
 			ibkt,
+			newTestBucketIndexMetadataReader(t, bkt, "test"),
 			f,
 			tmpDir,
 			mimir_tsdb.BucketStoreConfig{
@@ -1682,8 +1593,9 @@ func TestBucketStore_Series_Concurrency(t *testing.T) {
 
 					// Create the bucket store.
 					store, err := NewBucketStore(
-						"test-user",
+						"tenant",
 						instrumentedBucket,
+						newTestBucketIndexMetadataReader(t, instrumentedBucket, "tenant"),
 						metaFetcher,
 						tmpDir,
 						mimir_tsdb.BucketStoreConfig{
@@ -1757,12 +1669,12 @@ func TestBucketStore_Series_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 		Source: block.TestSource,
 	}
 
-	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(logger, nil, indexcache.InMemoryIndexCacheConfig{
-		MaxItemSize: 3000,
+	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(indexcache.InMemoryIndexCacheConfig{
+		MaxItemSizeBytes: 3000,
 		// This is the exact size of cache needed for our *single request*.
 		// This is limited in order to make sure we test evictions.
-		MaxSize: 8889,
-	})
+		MaxCacheSizeBytes: 8889,
+	}, nil, logger)
 	assert.NoError(t, err)
 
 	var b1 *bucketBlock
@@ -1853,10 +1765,11 @@ func TestBucketStore_Series_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	}
 
 	store := &BucketStore{
-		userID:     "test",
-		bkt:        objstore.WithNoopInstr(bkt),
-		logger:     logger,
-		indexCache: indexCache,
+		userID:          "test",
+		bkt:             objstore.WithNoopInstr(bkt),
+		bucketIndexMeta: newTestBucketIndexMetadataReader(t, bkt, "test"),
+		logger:          logger,
+		indexCache:      indexCache,
 		indexReaderPool: indexheader.NewReaderPool(log.NewNopLogger(), indexheader.Config{
 			LazyLoadingEnabled:     false,
 			LazyLoadingIdleTimeout: 0,
@@ -2010,12 +1923,13 @@ func TestBucketStore_Series_ErrorUnmarshallingRequestHints(t *testing.T) {
 	fetcher, err := block.NewMetaFetcher(logger, 10, instrBkt, tmpDir, nil, nil, 0)
 	assert.NoError(t, err)
 
-	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(logger, nil, indexcache.InMemoryIndexCacheConfig{})
+	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(indexcache.InMemoryIndexCacheConfig{}, nil, logger)
 	assert.NoError(t, err)
 
 	store, err := NewBucketStore(
 		"test",
 		instrBkt,
+		newTestBucketIndexMetadataReader(t, bkt, "test"),
 		fetcher,
 		tmpDir,
 		mimir_tsdb.BucketStoreConfig{
@@ -2073,6 +1987,7 @@ func TestBucketStore_Series_CanceledRequest(t *testing.T) {
 	store, err := NewBucketStore(
 		"test",
 		instrBkt,
+		newTestBucketIndexMetadataReader(t, instrBkt, "test"),
 		fetcher,
 		tmpDir,
 		mimir_tsdb.BucketStoreConfig{
@@ -2145,6 +2060,7 @@ func TestBucketStore_Series_TimeoutGate(t *testing.T) {
 	store, err := NewBucketStore(
 		"test",
 		instrBkt,
+		newTestBucketIndexMetadataReader(t, instrBkt, "test"),
 		fetcher,
 		tmpDir,
 		mimir_tsdb.BucketStoreConfig{
@@ -2223,6 +2139,7 @@ func TestBucketStore_Series_InvalidRequest(t *testing.T) {
 	store, err := NewBucketStore(
 		"test",
 		instrBkt,
+		newTestBucketIndexMetadataReader(t, instrBkt, "test"),
 		fetcher,
 		tmpDir,
 		mimir_tsdb.BucketStoreConfig{
@@ -2343,12 +2260,13 @@ func testBucketStoreSeriesBlockWithMultipleChunks(
 	fetcher, err := block.NewMetaFetcher(logger, 10, instrBkt, tmpDir, nil, nil, 0)
 	assert.NoError(t, err)
 
-	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(logger, nil, indexcache.InMemoryIndexCacheConfig{})
+	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(indexcache.InMemoryIndexCacheConfig{}, nil, logger)
 	assert.NoError(t, err)
 
 	store, err := NewBucketStore(
 		"tenant",
 		instrBkt,
+		newTestBucketIndexMetadataReader(t, instrBkt, "tenant"),
 		fetcher,
 		tmpDir,
 		mimir_tsdb.BucketStoreConfig{
@@ -2510,6 +2428,7 @@ func TestBucketStore_Series_Limits(t *testing.T) {
 					store, err := NewBucketStore(
 						"tenant",
 						instrBkt,
+						newTestBucketIndexMetadataReader(t, instrBkt, "tenant"),
 						fetcher,
 						tmpDir,
 						mimir_tsdb.BucketStoreConfig{
@@ -2622,13 +2541,14 @@ func setupStoreForHintsTest(t *testing.T, maxSeriesPerBatch int, opts ...BucketS
 	fetcher, err := block.NewMetaFetcher(logger, 10, instrBkt, tmpDir, nil, nil, 0)
 	assert.NoError(tb, err)
 
-	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(logger, nil, indexcache.InMemoryIndexCacheConfig{})
+	indexCache, err := indexcache.NewInMemoryIndexCacheWithConfig(indexcache.InMemoryIndexCacheConfig{}, nil, logger)
 	assert.NoError(tb, err)
 
 	opts = append([]BucketStoreOption{WithLogger(logger), WithIndexCache(indexCache)}, opts...)
 	store, err := NewBucketStore(
 		"tenant",
 		instrBkt,
+		newTestBucketIndexMetadataReader(t, instrBkt, "tenant"),
 		fetcher,
 		tmpDir,
 		mimir_tsdb.BucketStoreConfig{
@@ -2668,13 +2588,15 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 	type labelNamesValuesCase struct {
 		name string
 
-		labelNamesReq      *storepb.LabelNamesRequest
-		expectedNames      []string
-		expectedNamesHints hintspb.LabelNamesResponseHints
+		labelNamesReq            *storepb.LabelNamesRequest
+		expectedNames            []string
+		expectedOpaqueNamesHints hintspb.LabelNamesResponseHints
+		expectedNamesHints       *storepb.LabelNamesResponseHints
 
-		labelValuesReq      *storepb.LabelValuesRequest
-		expectedValues      []string
-		expectedValuesHints hintspb.LabelValuesResponseHints
+		labelValuesReq            *storepb.LabelValuesRequest
+		expectedValues            []string
+		expectedOpaqueValuesHints hintspb.LabelValuesResponseHints
+		expectedValuesHints       *storepb.LabelValuesResponseHints
 	}
 
 	testCases := []labelNamesValuesCase{
@@ -2686,8 +2608,13 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 				End:   1,
 			},
 			expectedNames: labelNamesFromSeriesSet(seriesSet1),
-			expectedNamesHints: hintspb.LabelNamesResponseHints{
+			expectedOpaqueNamesHints: hintspb.LabelNamesResponseHints{
 				QueriedBlocks: []hintspb.Block{
+					{Id: block1.String()},
+				},
+			},
+			expectedNamesHints: &storepb.LabelNamesResponseHints{
+				QueriedBlocks: []storepb.Block{
 					{Id: block1.String()},
 				},
 			},
@@ -2698,8 +2625,13 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 				End:   1,
 			},
 			expectedValues: []string{"1"},
-			expectedValuesHints: hintspb.LabelValuesResponseHints{
+			expectedOpaqueValuesHints: hintspb.LabelValuesResponseHints{
 				QueriedBlocks: []hintspb.Block{
+					{Id: block1.String()},
+				},
+			},
+			expectedValuesHints: &storepb.LabelValuesResponseHints{
+				QueriedBlocks: []storepb.Block{
 					{Id: block1.String()},
 				},
 			},
@@ -2714,8 +2646,14 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 			expectedNames: labelNamesFromSeriesSet(
 				append(append([]*storeTestSeries{}, seriesSet1...), seriesSet2...),
 			),
-			expectedNamesHints: hintspb.LabelNamesResponseHints{
+			expectedOpaqueNamesHints: hintspb.LabelNamesResponseHints{
 				QueriedBlocks: []hintspb.Block{
+					{Id: block1.String()},
+					{Id: block2.String()},
+				},
+			},
+			expectedNamesHints: &storepb.LabelNamesResponseHints{
+				QueriedBlocks: []storepb.Block{
 					{Id: block1.String()},
 					{Id: block2.String()},
 				},
@@ -2727,8 +2665,14 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 				End:   3,
 			},
 			expectedValues: []string{"1"},
-			expectedValuesHints: hintspb.LabelValuesResponseHints{
+			expectedOpaqueValuesHints: hintspb.LabelValuesResponseHints{
 				QueriedBlocks: []hintspb.Block{
+					{Id: block1.String()},
+					{Id: block2.String()},
+				},
+			},
+			expectedValuesHints: &storepb.LabelValuesResponseHints{
+				QueriedBlocks: []storepb.Block{
 					{Id: block1.String()},
 					{Id: block2.String()},
 				},
@@ -2747,8 +2691,13 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 				}),
 			},
 			expectedNames: labelNamesFromSeriesSet(seriesSet1),
-			expectedNamesHints: hintspb.LabelNamesResponseHints{
+			expectedOpaqueNamesHints: hintspb.LabelNamesResponseHints{
 				QueriedBlocks: []hintspb.Block{
+					{Id: block1.String()},
+				},
+			},
+			expectedNamesHints: &storepb.LabelNamesResponseHints{
+				QueriedBlocks: []storepb.Block{
 					{Id: block1.String()},
 				},
 			},
@@ -2764,8 +2713,13 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 				}),
 			},
 			expectedValues: []string{"1"},
-			expectedValuesHints: hintspb.LabelValuesResponseHints{
+			expectedOpaqueValuesHints: hintspb.LabelValuesResponseHints{
 				QueriedBlocks: []hintspb.Block{
+					{Id: block1.String()},
+				},
+			},
+			expectedValuesHints: &storepb.LabelValuesResponseHints{
+				QueriedBlocks: []storepb.Block{
 					{Id: block1.String()},
 				},
 			},
@@ -2778,25 +2732,39 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expectedNames, namesResp.Names)
 
-			var namesHints hintspb.LabelNamesResponseHints
-			assert.NoError(t, types.UnmarshalAny(namesResp.Hints, &namesHints))
+			var opaqueNamesHints hintspb.LabelNamesResponseHints
+			//nolint:staticcheck // Ignore SA1019. This use will be removed in Mimir 3.2
+			assert.NoError(t, types.UnmarshalAny(namesResp.Hints, &opaqueNamesHints))
 			// The order is not determinate, so we are sorting them.
-			slices.SortFunc(namesHints.QueriedBlocks, func(a, b hintspb.Block) int {
+			slices.SortFunc(opaqueNamesHints.QueriedBlocks, func(a, b hintspb.Block) int {
 				return strings.Compare(a.Id, b.Id)
 			})
-			assert.Equal(t, tc.expectedNamesHints, namesHints)
+			assert.Equal(t, tc.expectedOpaqueNamesHints, opaqueNamesHints)
 
 			valuesResp, err := store.LabelValues(context.Background(), tc.labelValuesReq)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expectedValues, valuesResp.Values)
 
-			var valuesHints hintspb.LabelValuesResponseHints
-			assert.NoError(t, types.UnmarshalAny(valuesResp.Hints, &valuesHints))
+			var opaqueValuesHints hintspb.LabelValuesResponseHints
+			//nolint:staticcheck // Ignore SA1019. This use will be removed in Mimir 3.2
+			assert.NoError(t, types.UnmarshalAny(valuesResp.Hints, &opaqueValuesHints))
 			// The order is not determinate, so we are sorting them.
-			slices.SortFunc(valuesHints.QueriedBlocks, func(a, b hintspb.Block) int {
+			slices.SortFunc(opaqueValuesHints.QueriedBlocks, func(a, b hintspb.Block) int {
 				return strings.Compare(a.Id, b.Id)
 			})
-			assert.Equal(t, tc.expectedValuesHints, valuesHints)
+			assert.Equal(t, tc.expectedOpaqueValuesHints, opaqueValuesHints)
+
+			// Verify the non-opaque hint types. We currently return both opaque and non-opaque
+			// hints from label name and label value requests.
+			slices.SortFunc(namesResp.ResponseHints.QueriedBlocks, func(a, b storepb.Block) int {
+				return strings.Compare(a.Id, b.Id)
+			})
+			assert.Equal(t, tc.expectedNamesHints, namesResp.ResponseHints)
+
+			slices.SortFunc(valuesResp.ResponseHints.QueriedBlocks, func(a, b storepb.Block) int {
+				return strings.Compare(a.Id, b.Id)
+			})
+			assert.Equal(t, tc.expectedValuesHints, valuesResp.ResponseHints)
 		})
 	}
 }

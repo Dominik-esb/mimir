@@ -699,6 +699,7 @@ How to **investigate**:
           ```
           ./tools/mark-blocks/mark-blocks -backend gcs -gcs.bucket-name <bucket> -mark-type no-compact -tenant <tenant-id> -details "Leading to out-of-order chunks when compacting with other blocks" -blocks "<block-1>,<block-2>..."
           ```
+          For examples using AWS S3 or Azure, see [How to use the mark-blocks tool](#how-to-use-the-mark-blocks-tool).
   - Result block exceeds symbol table maximum size:
     - **How to detect**: Search compactor logs for `symbol table size exceeds`.
     - **What it means**: The compactor successfully validated the source blocks. But the resulting block is impossible to write due to the error above.
@@ -714,22 +715,12 @@ How to **investigate**:
         ```
         ./tools/mark-blocks/mark-blocks -backend gcs -gcs.bucket-name <bucket> -mark-type no-compact -tenant <tenant-id> -details "Result block exceeds symbol table maximum size" -blocks "<block-1>,<block-2>..."
         ```
+        For examples using AWS S3 or Azure, see [How to use the mark-blocks tool](#how-to-use-the-mark-blocks-tool).
     - Further reading: [Compaction algorithm](../../references/architecture/components/compactor/#compaction-algorithm).
   - Compactor network disk unresponsive:
     - **How to detect**: A telltale sign is having many cores of sustained kernel-mode CPU usage by the compactor process. Check the metric `rate(container_cpu_system_seconds_total{pod="<pod>"}[$__rate_interval])` for the affected pod.
     - **What it means**: The compactor process has frozen because it's blocked on kernel-mode flushes to an unresponsive network block storage device.
     - **How to mitigate**: Unknown. This typically self-resolves after ten to twenty minutes.
-  - Result block index postings offsets table exceeds maximum size:
-    - **How to detect**: Search compactor logs for `length size exceeds`.
-    - **What it means**: Compactor block merging fails because the resulting postings offsets table gets too large.
-    - This is caused by extremely high label cardinality, which can be handled by increasing `compactor_split_and_merge_shards`.
-    - **How to mitigate**:
-      1. These blocks are impossible to compact, mark the source blocks indicated in the error messages with `no-compact`.
-      - GCS example:
-      ```
-      ./tools/mark-blocks/mark-blocks -backend gcs -gcs.bucket-name <bucket> -mark-type no-compact -tenant <tenant-id> -details "Result block exceeds postings offsets table maximum size" -blocks "<block-1>,<block-2>..."
-      ```
-      1. Double the `compactor_split_and_merge_shards` compactor for the affected tenant ([example PR](https://github.com/grafana/deployment_tools/pull/438877)).
 
 - Check the [Compactor Dashboard](../monitor-grafana-mimir/dashboards/compactor/) and set it to view the last 7 days.
 
@@ -764,12 +755,13 @@ How to **fix** it:
   ```
   ./tools/mark-blocks/mark-blocks -backend gcs -gcs.bucket-name <bucket> -mark-type no-compact -tenant <tenant-id> -details "focus on newer blocks" -blocks "<block 1>,<block 2>..."
   ```
+  For examples using AWS S3 or Azure, see [How to use the mark-blocks tool](#how-to-use-the-mark-blocks-tool).
 
-### MimirCompactorSkippedUnhealthyBlocks
+### MimirCompactorSkippedBlocks
 
-This alert fires when compactor tries to compact a block, but finds that given block is unhealthy. This indicates a bug in Prometheus TSDB library and should be investigated.
+This alert fires when compactor tries to compact a block, fails, and automatically marks one or more blocks as `no-compact` to unblock future compactions. There are several reasons this can happen, each meriting investigation.
 
-#### Compactor is failing because of `not healthy index found`
+#### Compaction is failing because of `not healthy index found` (reason: `critical`)
 
 The compactor may fail to compact blocks due to a corrupted block index found in one of the source blocks:
 
@@ -798,14 +790,47 @@ Where:
 - `TENANT` is the tenant id reported in the example error message above as `REDACTED-TENANT`
 - `BLOCK` is the last part of the file path reported as `REDACTED-BLOCK` in the example error message above
 
+#### Compaction is failing because of `postings offset table size limit` (reason: `postings-offset-table-too-large`)
+
+The compactor may fail to compact blocks due to the size of the postings offset table of the result block exceeding 4GiB (its length exceeds 4 bytes):
+
+```
+ts=2025-12-23T00:37:18.252772Z caller=bucket_compactor.go:272 level=error component=compactor user=test groupKey=0@17241709254077376921-merge-7_of_16-1765497600000-1765584000000 job_type=merge minTime="2025-12-12 00:00:00 +0000 UTC" maxTime="2025-12-13 00:00:00 +0000 UTC" msg="compaction job failed" duration=5m54.874925125s duration_ms=354874 err="compact blocks 01KCA08M9RP54T810CKNQ0H4TZ,01KCBGA8D2WD2HV431NTFZ1M84: writing block: closing index writer: postings offset table length/crc32 write error: length size exceeds 4 bytes: 4460043400" block_count=2
+
+```
+
+The cause is high label cardinality in the source blocks. When this happens, the input blocks will be marked as `no-compact` by the compactor in order to prevent the next execution from being blocked.
+
+If this happens once for a tenant when compacting 12 hour blocks into 24 hour blocks, it's possible they had increased cardinality just on that one day and we don't need to take corrective action. However, if this happens multiple times for a tenant, or is happening in earlier stages of compaction, you should increase the `compactor_split_and_merge_shards` for the tenant.
+
 ### MimirCompactorBuildingSparseIndexFailed
 
-This alert fires when `-compactor.upload-sparse-index-headers` is set to `true` but the compactor fails to build some sparse index headers.
+This alert fires when the compactor fails to build some sparse index headers.
 
 How to **investigate**:
 
 - If the alert `MimirCompactorHasRunOutOfDiskSpace` has fired as well, then investigate that issue first. If there is no disk space available, the compactor will fail to write sparse headers to local disk prior to upload.
 - Look for any errors in the compactor logs, focusing on logs with `method=indexheader.NewStreamBinaryReader`.
+
+### MimirCompactorOOMKilled
+
+This alert fires when compactor pods have been terminated due to Out of Memory (OOM) conditions.
+
+Frequent OOM kills indicate that the compactor does not have enough memory to process the blocks it is compacting. This can lead to compaction falling behind, which negatively impacts query performance.
+
+How to **investigate**:
+
+- Check the compactor's memory usage in the `Mimir / Compactor Resources` dashboard to understand the memory consumption pattern.
+- Look for `OOMKilled` events in the Kubernetes events for the compactor pods:
+  ```
+  kubectl get events --field-selector reason=OOMKilling -n <namespace>
+  ```
+
+How to **fix** it:
+
+- Increase the memory request and limit for the compactor pods.
+- If specific tenants are causing OOMs due to high cardinality, consider increasing the `compactor_split_and_merge_shards` for those tenants to produce smaller blocks.
+- Reduce compactor concurrency (`-compactor.compaction-concurrency`) to lower peak memory usage, at the cost of slower compaction.
 
 ### MimirBucketIndexNotUpdated
 
@@ -1575,7 +1600,13 @@ How to **investigate** and **fix** it:
 
 - Check if disk utilization unbalance is caused by shuffle sharding
 
-  - Investigate which tenants use most of the store-gateway disk in the replicas with highest disk utilization. To investigate it you can run the following command for a given store-gateway replica. The command returns the top 10 tenants by disk utilization (in megabytes):
+  - Investigate which tenants use most of the store-gateway disk in the replicas with highest disk utilization. You can query the `cortex_bucket_store_blocks_loaded_size_bytes` metric to see per-tenant disk utilization across all store-gateway replicas. For example, to find the top 10 tenants by disk utilization on a specific store-gateway pod:
+
+    ```
+    topk(10, cortex_bucket_store_blocks_loaded_size_bytes{pod="$POD"})
+    ```
+
+  - Alternatively, you can run the following command for a given store-gateway replica to check disk utilization directly on the pod. The command returns the top 10 tenants by disk utilization (in megabytes):
 
     ```
     kubectl --context $CLUSTER --namespace $NAMESPACE debug pod/$POD --image=alpine:latest --target=store-gateway --container=debug -ti -- sh -c 'du -sm /proc/1/root/data/tsdb/* | sort -n -r | head -10'
@@ -1683,18 +1714,19 @@ In this context, any reference to Kafka means a Kafka protocol-compatible backen
 
 ### MimirIngesterOffsetCommitFailed
 
-This alert fires when an ingester is failing to commit the last consumed offset to the Kafka backend.
+This alert fires when an ingester is failing to commit the last consumed offset to the Kafka backend or to the file-based offset storage.
 
 How it **works**:
 
-- The ingester ingests data (metrics, exemplars, ...) from Kafka and periodically commits the last consumed offset back to Kafka.
-- At startup, an ingester reads the last consumed offset committed to Kafka and resumes the consumption from there.
-- If the ingester fails to commit the last consumed offset to Kafka, the ingester keeps working correctly from the consumption perspective (assuming there's no other on-going issue in the cluster) but in case of a restart the ingester will resume the consumption from the last successfully committed offset. If the last offset was successfully committed several minutes ago, the ingester will re-ingest data which has already been ingested, potentially causing OOO errors, wasting resources and taking longer to startup.
+- The ingester ingests data (metrics, exemplars, ...) from Kafka and periodically commits the last consumed offset back to Kafka and, when configured, to a file in the TSDB directory (`kafka-offset.json`).
+- At startup, an ingester reads the last consumed offset (from Kafka consumer group metadata or from the file if file-based offset enforcement is enabled) and resumes the consumption from there.
+- If the ingester fails to commit the last consumed offset to Kafka or to the file, the ingester keeps working correctly from the consumption perspective (assuming there's no other on-going issue in the cluster) but in case of a restart the ingester will resume the consumption from the last successfully committed offset. If the last offset was successfully committed several minutes ago, the ingester will re-ingest data which has already been ingested, potentially causing OOO errors, wasting resources and taking longer to startup.
 
 How to **investigate**:
 
-- Check ingester logs to find details about the error.
+- Check ingester logs to find details about the error (Kafka commit failure, file write failure, or both).
 - Check Kafka logs and health.
+- When file-based offset enforcement is enabled, check that the TSDB directory is writable and has sufficient disk space for the offset file.
 
 ### MimirIngesterKafkaReadFailed
 
@@ -1936,7 +1968,7 @@ How to **investigate**:
 
 Data recovery / temporary mitigation: Refer the runbook for `MimirBlockBuilderNoCycleProcessing` above.
 
-#### MimirBlockBuilderHasNotShippedBlocks
+### MimirBlockBuilderHasNotShippedBlocks
 
 Similar to [`MimirIngesterNotShippingBlocks`](#MimirIngesterNotShippingBlocks) but for block-builder.
 
@@ -1953,14 +1985,33 @@ How to **investigate**:
 
 Data recovery / temporary mitigation:
 
-If the block-builder permanently missed consuming some portion of the partition, or there is an ongoing issue preventing it from consuming, try the following:
+If the block-builder permanently missed consuming some portion of the partition, or there is an ongoing issue with the code preventing it from consuming, try the following:
 
-- Increase the retention of the Kafka topic to buy some time.
-- Spin up a new set of block-builders and block-builder-scheduler with an older version and a **new kafka consumer group**. The latter is so it didn't conflict with the existing block-builders. Choose the last version where no issue was seen; in most cases it will be the version before the one that caused the alert.
-- If the `block-builder-scheduler.lookback-on-no-commit` does not cover the time when the issue started, set it long enough so that these new block-builders start back far enough to cover the missing data.
-- Investigate why the block-builder fails, while the ingesters, who consumed the same data, don't.
+1. Consider increasing the retention of the Kafka topic to buy some time.
+2. Spin up a new set of block-builders and block-builder-scheduler with an older version and a **new kafka consumer group**. The latter is so it didn't conflict with the existing block-builders. Choose the last version where no issue was seen; in most cases it will be the version before the one that caused the alert.
+3. If the `block-builder-scheduler.lookback-on-no-commit` does not cover the time when the issue started, set it long enough so that these new block-builders start back far enough to cover the missing data.
+4. Investigate why the block-builder fails, while the ingesters, who consumed the same data, don't.
 
-#### MimirBlockBuilderSchedulerNotRunning
+If you just need to "rewind" the commit for a number of partitions so block-builder can consume a skipped section of data:
+
+1. Identify which partitions whose commit needs to be rewound, and the offsets they should be set to.
+2. Verify that you can use the Kafka command line tool `kafka-consumer-groups.sh`, which comes commonly in Kafka distributions and container images. (e.g., in `bitnamilegacy/kafka`.)
+3. To avoid consumer group offset conflicts, scale down to zero replicas or otherwise disable any running `block-builder-scheduler` replicas.
+4. Execute the command in _dry-run mode_:
+
+   `kafka-consumer-groups.sh --group $BLOCK_BUILDER_GROUP --topic $TOPIC:$PARTITION --reset-offsets --to-offset $OFFSET --dry-run`
+
+   where:
+
+   - `BLOCK_BUILDER_GROUP` is the consumer group specified in the `block-builder-scheduler` configuration. ("block-builder" by default.)
+   - `TOPIC` is the Kafka topic specified in the `block-builder-scheduler` configuration.
+   - `PARTITION` and `OFFSET` are the first pair of items located in step 1
+
+5. If you are satisfied with the result, run it again without the `--dry-run` flag.
+6. Repeat for the other partition/offset pairs from step 1.
+7. Re-enable block-builder-scheduler, and verify using logs that it begins creating jobs starting from the offsets you've rewound to.
+
+### MimirBlockBuilderSchedulerNotRunning
 
 This fires when the block-builder-scheduler has not performed its critical job scheduling duties in the last 30 minutes. It can indicate that the service is suddenly not running, or is degraded.
 
@@ -1974,7 +2025,7 @@ How to **investigate**:
 - This generally means something is either wrong with the block-builder-scheduler replica or the Kafka system it is attempting to monitor. Viewing logs for the block-builder-scheduler should help you to identify the problem.
 - If there are no logs, then the block-builder-scheduler may not be running, which you can investigate by examining the StatefulSet/pod details in Kubernetes.
 
-#### MimirBlockBuilderDataSkipped
+### MimirBlockBuilderDataSkipped
 
 This alert fires when the block-builder-scheduler has detected a gap in either committed jobs or planned jobs.
 
@@ -1993,7 +2044,7 @@ Data recovery / temporary mitigation:
 
 You need to make block-builder consume the skipped data. Refer to the section under "Data recovery" for the `MimirBlockBuilderHasNotShippedBlocks` alert.
 
-#### MimirBlockBuilderPersistentJobFailure
+### MimirBlockBuilderPersistentJobFailure
 
 This alert fires when the block-builder-scheduler has detected a single job failing multiple times.
 
@@ -3111,6 +3162,80 @@ Halting the ingesters should be the **very last resort** because of the side eff
 However the **queries will return partial data**, due to all the ingested samples which have not been compacted to blocks yet.
 
 ## Manual procedures
+
+### How to use the mark-blocks tool
+
+The `mark-blocks` tool creates or removes markers for TSDB blocks in object storage. This is commonly needed for:
+
+- Marking blocks for deletion (using `-mark-type deletion`)
+- Marking blocks to prevent compaction (using `-mark-type no-compact`)
+
+The tool is located at `tools/mark-blocks/` in the Mimir repository. Build it with `go build` in that directory, or use the pre-built binary from Mimir releases.
+
+#### Google Cloud Storage (GCS)
+
+```bash
+./mark-blocks \
+  --backend gcs \
+  --gcs.bucket-name <bucket> \
+  --tenant <tenant-id> \
+  --mark-type <deletion|no-compact> \
+  --details "<reason for marking>" \
+  --blocks "<block-1>,<block-2>..." \
+  --dry-run
+```
+
+GCS uses Application Default Credentials. Ensure you have authenticated using `gcloud auth application-default login` or are running on a GCE instance with appropriate service account permissions.
+
+#### Amazon S3 with AWS Profile Authentication
+
+```bash
+export AWS_PROFILE=<your-aws-profile>
+
+./mark-blocks \
+  --backend s3 \
+  --s3.bucket-name <bucket> \
+  --s3.region <region> \
+  --s3.native-aws-auth-enabled=true \
+  --tenant <tenant-id> \
+  --mark-type <deletion|no-compact> \
+  --details "<reason for marking>" \
+  --blocks "<block-1>,<block-2>..." \
+  --dry-run
+```
+
+This method uses the AWS SDK's default credential chain, which supports environment variables, shared credentials files (`~/.aws/credentials`), and IAM roles.
+
+#### Amazon S3 with Access Keys
+
+```bash
+./mark-blocks \
+  --backend s3 \
+  --s3.bucket-name <bucket> \
+  --s3.access-key-id <access-key-id> \
+  --s3.secret-access-key <secret-access-key> \
+  --s3.endpoint <endpoint> \
+  --tenant <tenant-id> \
+  --mark-type <deletion|no-compact> \
+  --details "<reason for marking>" \
+  --blocks "<block-1>,<block-2>..." \
+  --dry-run
+```
+
+#### Azure Blob Storage
+
+```bash
+./mark-blocks \
+  --backend azure \
+  --azure.container-name <container> \
+  --azure.account-name <account-name> \
+  --azure.account-key <account-key> \
+  --tenant <tenant-id> \
+  --mark-type <deletion|no-compact> \
+  --details "<reason for marking>" \
+  --blocks "<block-1>,<block-2>..." \
+  --dry-run
+```
 
 ### Resizing Persistent Volumes using Kubernetes
 

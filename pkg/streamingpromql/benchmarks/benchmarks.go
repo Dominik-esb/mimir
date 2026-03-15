@@ -117,6 +117,20 @@ func TestCases(metricSizes []int) []BenchCase {
 			Steps: 10000,
 		},
 		{
+			Expr: "delta(a_X[1m] smoothed)",
+		},
+		{
+			Expr:  "delta(a_X[1m] smoothed)",
+			Steps: 10000,
+		},
+		{
+			Expr: "delta(a_X[2h] smoothed)",
+		},
+		{
+			Expr:  "delta(a_X[2h] smoothed)",
+			Steps: 10000,
+		},
+		{
 			Expr: "rate(a_X[1m] anchored)",
 		},
 		{
@@ -403,6 +417,18 @@ func TestCases(metricSizes []int) []BenchCase {
 		},
 		{
 			Expr: "sum(sum_over_time(a_X[1d])) / sum(count_over_time(a_X[1d]))",
+		},
+		{
+			Expr: `info(info_sparse_100, {__name__="target_info_X"})`,
+		},
+		{
+			Expr: `info(info_sparse_2000, {__name__="target_info_X"})`,
+		},
+		{
+			Expr: `info(info_dense_100, {__name__="target_info_X"})`,
+		},
+		{
+			Expr: `info(info_dense_2000, {__name__="target_info_X"})`,
 		},
 	}
 

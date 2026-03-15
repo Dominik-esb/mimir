@@ -124,6 +124,9 @@ type userTSDB struct {
 	// Unix timestamp of last deletion mark check.
 	lastDeletionMarkCheck atomic.Int64
 
+	// Unix timestamp (milliseconds) of last early head compaction (any type).
+	lastEarlyCompaction atomic.Int64
+
 	// for statistics
 	ingestedAPISamples  *util_math.EwmaRate
 	ingestedRuleSamples *util_math.EwmaRate
@@ -252,6 +255,20 @@ func (u *userTSDB) changeStateToForcedCompaction(from tsdbState, forcedCompactio
 	return u.changeState(from, forceCompacting, func() {
 		u.forcedCompactionMaxTime = forcedCompactionMaxTime
 	})
+}
+
+// setClosingState unconditionally sets the TSDB state to closing.
+// This is used during ingester shutdown to prevent new appends from starting.
+// Unlike changeState, this doesn't require a specific "from" state since during
+// shutdown we need to close regardless of the current state.
+func (u *userTSDB) setClosingState() {
+	u.stateMtx.Lock()
+	defer u.stateMtx.Unlock()
+
+	// Only transition if not already closing or closed
+	if u.state != closing && u.state != closed {
+		u.state = closing
+	}
 }
 
 // compactHead triggers a forced compaction of the TSDB Head. This function compacts the in-order Head
@@ -685,4 +702,16 @@ func (u *userTSDB) computeOwnedSeries() int {
 		}
 	})
 	return count
+}
+
+func (u *userTSDB) setLastEarlyCompaction(t time.Time) {
+	u.lastEarlyCompaction.Store(t.UnixMilli())
+}
+
+func (u *userTSDB) getLastEarlyCompaction() time.Time {
+	ts := u.lastEarlyCompaction.Load()
+	if ts == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ts)
 }

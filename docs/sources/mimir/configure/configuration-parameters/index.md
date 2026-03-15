@@ -175,10 +175,6 @@ api:
 # The ingester block configures the ingester.
 [ingester: <ingester>]
 
-# The flusher block configures the WAL flusher target, used to manually run
-# one-time flushes when scaling down ingesters.
-[flusher: <flusher>]
-
 # The limits block configures default and per-tenant limits imposed by
 # components.
 [limits: <limits>]
@@ -449,7 +445,7 @@ overrides_exporter:
   # Comma-separated list of metrics to include in the exporter. Metric names
   # must match yaml tags from the limits section of the configuration.
   # CLI flag: -overrides-exporter.enabled-metrics
-  [enabled_metrics: <string> | default = "ingestion_rate,ingestion_burst_size,max_global_series_per_user,max_global_series_per_metric,max_global_exemplars_per_user,max_fetched_chunks_per_query,max_fetched_series_per_query,max_fetched_chunk_bytes_per_query,ruler_max_rules_per_rule_group,ruler_max_rule_groups_per_tenant"]
+  [enabled_metrics: <string> | default = "ingestion_burst_size,ingestion_rate,max_fetched_chunk_bytes_per_query,max_fetched_chunks_per_query,max_fetched_series_per_query,max_global_exemplars_per_user,max_global_series_per_metric,max_global_series_per_user,ruler_max_rule_groups_per_tenant,ruler_max_rules_per_rule_group"]
 
 # The common block holds configurations that configure multiple components at a
 # time.
@@ -518,6 +514,25 @@ client_cluster_validation:
   # (experimental) Primary cluster validation label.
   # CLI flag: -common.client-cluster-validation.label
   [label: <string> | default = ""]
+
+instrument_ref_leaks:
+  # (experimental) Percentage [0-100] of request or message buffers to
+  # instrument for reference leaks. Set to 0 to disable.
+  # CLI flag: -common.instrument-reference-leaks.percentage
+  [percentage: <float> | default = 0]
+
+  # (experimental) Period after a buffer instrumented for referenced leaks is
+  # nominally freed until the buffer is uninstrumented and effectively freed to
+  # be reused. After this period, any lingering references to the buffer may
+  # potentially be dereferenced again with no detection.
+  # CLI flag: -common.instrument-reference-leaks.before-reuse-period
+  [before_reuse_period: <duration> | default = 2m]
+
+  # (experimental) Maximum sum of length of buffers instrumented at any given
+  # time, in bytes. When surpassed, incoming buffers will not be instrumented,
+  # regardless of the configured percentage. Zero means no limit.
+  # CLI flag: -common.instrument-reference-leaks.max-inflight-instrumented-bytes
+  [max_inflight_instrumented_bytes: <int> | default = 0]
 ```
 
 ### server
@@ -720,6 +735,16 @@ grpc_tls_config:
 # CLI flag: -server.grpc.num-workers
 [grpc_server_num_workers: <int> | default = 100]
 
+# Size of the read buffer for each gRPC connection (bytes). A smaller buffer may
+# reduce memory usage but may lead to more system calls.
+# CLI flag: -server.grpc.read-buffer-size-bytes
+[grpc_server_read_buffer_size: <int> | default = 32768]
+
+# Size of the write buffer for each gRPC connection (bytes). A smaller buffer
+# may reduce memory usage but may lead to more system calls.
+# CLI flag: -server.grpc.write-buffer-size-bytes
+[grpc_server_write_buffer_size: <int> | default = 32768]
+
 # Output log messages in the given format. Valid formats: [logfmt, json]
 # CLI flag: -log.format
 [log_format: <string> | default = "logfmt"]
@@ -821,6 +846,12 @@ cluster_validation:
     # the cluster validation check.
     # CLI flag: -server.cluster-validation.http.excluded-user-agents
     [excluded_user_agents: <string> | default = ""]
+
+# Creates new traces for each call rather than continuing the existing trace. A
+# span link is used to allow navigation to the parent trace. Only works when
+# using Open-Telemetry tracing.
+# CLI flag: -server.create-new-traces
+[create_new_traces: <boolean> | default = false]
 ```
 
 ### distributor
@@ -1065,6 +1096,15 @@ reactive_limiter:
   # requests
   # CLI flag: -distributor.reactive-limiter.max-limit-factor
   [max_limit_factor: <float> | default = 5]
+
+  # (experimental) Logarithmic decay applied to the maxLimitFactor based on
+  # current inflight requests
+  # CLI flag: -distributor.reactive-limiter.max-limit-factor-decay
+  [max_limit_factor_decay: <float> | default = 1]
+
+  # (experimental) Minimum limit factor when max-limit-factor-decay is applied
+  # CLI flag: -distributor.reactive-limiter.min-limit-factor
+  [min_limit_factor: <float> | default = 1.2]
 
   # (experimental) Minimum duration of the window that is used to collect recent
   # response time samples
@@ -1510,6 +1550,15 @@ push_reactive_limiter:
   # CLI flag: -ingester.push-reactive-limiter.max-limit-factor
   [max_limit_factor: <float> | default = 5]
 
+  # (experimental) Logarithmic decay applied to the maxLimitFactor based on
+  # current inflight requests
+  # CLI flag: -ingester.push-reactive-limiter.max-limit-factor-decay
+  [max_limit_factor_decay: <float> | default = 1]
+
+  # (experimental) Minimum limit factor when max-limit-factor-decay is applied
+  # CLI flag: -ingester.push-reactive-limiter.min-limit-factor
+  [min_limit_factor: <float> | default = 1.2]
+
   # (experimental) Minimum duration of the window that is used to collect recent
   # response time samples
   # CLI flag: -ingester.push-reactive-limiter.recent-window-min-duration
@@ -1572,6 +1621,15 @@ read_reactive_limiter:
   # requests
   # CLI flag: -ingester.read-reactive-limiter.max-limit-factor
   [max_limit_factor: <float> | default = 5]
+
+  # (experimental) Logarithmic decay applied to the maxLimitFactor based on
+  # current inflight requests
+  # CLI flag: -ingester.read-reactive-limiter.max-limit-factor-decay
+  [max_limit_factor_decay: <float> | default = 1]
+
+  # (experimental) Minimum limit factor when max-limit-factor-decay is applied
+  # CLI flag: -ingester.read-reactive-limiter.min-limit-factor
+  [min_limit_factor: <float> | default = 1.2]
 
   # (experimental) Minimum duration of the window that is used to collect recent
   # response time samples
@@ -1864,10 +1922,11 @@ store_gateway_client:
 # CLI flag: -querier.lookback-delta
 [lookback_delta: <duration> | default = 5m]
 
-# (experimental) Enable the experimental Prometheus feature for delayed name
-# removal.
-# CLI flag: -querier.enable-delayed-name-removal
-[enable_delayed_name_removal: <boolean> | default = false]
+# (experimental) Enable the experimental PromQL feature for delayed name removal
+# in the Prometheus engine. Note that this only applies when the Prometheus
+# engine is selected or used as fallback from the Mimir Query Engine.
+# CLI flag: -querier.enable-delayed-name-removal-prometheus-engine
+[enable_delayed_name_removal_prometheus_engine: <boolean> | default = false]
 
 mimir_query_engine:
   # (experimental) Enable pruning query expressions that are toggled off with
@@ -1880,17 +1939,6 @@ mimir_query_engine:
   # CLI flag: -querier.mimir-query-engine.enable-common-subexpression-elimination
   [enable_common_subexpression_elimination: <boolean> | default = true]
 
-  # (experimental) Enable common subexpression elimination for range vector
-  # expressions when evaluating instant queries. This has no effect if common
-  # subexpression elimination is disabled.
-  # CLI flag: -querier.mimir-query-engine.enable-common-subexpression-elimination-for-range-vector-expressions-in-instant-queries
-  [enable_common_subexpression_elimination_for_range_vector_expressions_in_instant_queries: <boolean> | default = true]
-
-  # (experimental) Enable skipping decoding native histograms when evaluating
-  # queries that do not require full histograms.
-  # CLI flag: -querier.mimir-query-engine.enable-skipping-histogram-decoding
-  [enable_skipping_histogram_decoding: <boolean> | default = true]
-
   # (experimental) Enable generating selectors for one side of a binary
   # expression based on results from the other side.
   # CLI flag: -querier.mimir-query-engine.enable-narrow-binary-selectors
@@ -1900,12 +1948,48 @@ mimir_query_engine:
   # the query plan when it can be proven that each input series produces a
   # unique output series.
   # CLI flag: -querier.mimir-query-engine.enable-eliminate-deduplicate-and-merge
-  [enable_eliminate_deduplicate_and_merge: <boolean> | default = false]
+  [enable_eliminate_deduplicate_and_merge: <boolean> | default = true]
 
   # (experimental) Enable eliminating duplicate or redundant matchers that are
   # part of selector expressions.
   # CLI flag: -querier.mimir-query-engine.enable-reduce-matchers
   [enable_reduce_matchers: <boolean> | default = true]
+
+  # (experimental) Enable projection pushdown to only fetch labels required for
+  # the query from storage.
+  # CLI flag: -querier.mimir-query-engine.enable-projection-pushdown
+  [enable_projection_pushdown: <boolean> | default = false]
+
+  # (experimental) Enable computing multiple aggregations over the same data
+  # without buffering. Requires common subexpression elimination to be enabled.
+  # CLI flag: -querier.mimir-query-engine.enable-multi-aggregation
+  [enable_multi_aggregation: <boolean> | default = true]
+
+  range_vector_splitting:
+    # (experimental) Enable splitting function over range vectors queries into
+    # smaller blocks for caching.
+    # CLI flag: -querier.mimir-query-engine.range-vector-splitting.enabled
+    [enabled: <boolean> | default = false]
+
+    # (experimental) Time interval used for splitting function over range
+    # vectors queries into cacheable blocks.
+    # CLI flag: -querier.mimir-query-engine.range-vector-splitting.split-interval
+    [split_interval: <duration> | default = 2h]
+
+    intermediate_results_cache:
+      # Backend for intermediate results cache, if not empty. Supported values:
+      # memcached.
+      # CLI flag: -querier.mimir-query-engine.range-vector-splitting.backend
+      [backend: <string> | default = ""]
+
+      # The memcached block configures the Memcached-based caching backend.
+      # The CLI flags prefix for this block configuration is:
+      # querier.mimir-query-engine.range-vector-splitting
+      [memcached: <memcached>]
+
+      # Enable cache compression, if not empty. Supported values are: snappy.
+      # CLI flag: -querier.mimir-query-engine.range-vector-splitting.compression
+      [compression: <string> | default = ""]
 
 ring:
   # The key-value store used to share the hash ring across multiple instances.
@@ -3206,17 +3290,6 @@ local:
   [path: <string> | default = ""]
 ```
 
-### flusher
-
-The `flusher` block configures the WAL flusher target, used to manually run one-time flushes when scaling down ingesters.
-
-```yaml
-# (advanced) Stop after flush has finished. If false, process will keep running,
-# doing nothing.
-# CLI flag: -flusher.exit-after-flush
-[exit_after_flush: <boolean> | default = true]
-```
-
 ### ingester_client
 
 The `ingester_client` block configures how the distributors connect to the ingesters.
@@ -3556,12 +3629,6 @@ grpc_client_config:
 # query-scheduler.
 # The CLI flags prefix for this block configuration is: querier.scheduler-client
 [query_scheduler_grpc_client_config: <grpc_client>]
-
-# (experimental) Enables streaming of responses from querier to query-frontend
-# for response types that support it (currently only `active_series` responses
-# do).
-# CLI flag: -querier.response-streaming-enabled
-[response_streaming_enabled: <boolean> | default = false]
 ```
 
 ### etcd
@@ -3799,10 +3866,11 @@ The `memberlist` block configures the Gossip memberlist.
 # CLI flag: -memberlist.cluster-label-verification-disabled
 [cluster_label_verification_disabled: <boolean> | default = false]
 
-# Other cluster members to join. Can be specified multiple times. It can be an
-# IP, hostname or an entry specified in the DNS Service Discovery format.
+# Other cluster members to join. Can be specified multiple times or as a
+# comma-separated list. It can be an IP, hostname or an entry specified in the
+# DNS Service Discovery format.
 # CLI flag: -memberlist.join
-[join_members: <list of strings> | default = []]
+[join_members: <list of strings> | default = ]
 
 # (advanced) Min backoff duration to join other cluster members.
 # CLI flag: -memberlist.min-join-backoff
@@ -3823,6 +3891,12 @@ The `memberlist` block configures the Gossip memberlist.
 # CLI flag: -memberlist.abort-if-fast-join-fails
 [abort_if_cluster_fast_join_fails: <boolean> | default = false]
 
+# (advanced) Minimum number of seed nodes that must be successfully joined
+# during fast-join for it to succeed. Only applies when
+# -memberlist.abort-if-fast-join-fails is enabled.
+# CLI flag: -memberlist.abort-if-fast-join-fails-min-nodes
+[abort_if_cluster_fast_join_fails_min_nodes: <int> | default = 1]
+
 # Abort if this node fails to join memberlist cluster at startup. When enabled,
 # it's not guaranteed that other services are started only after the cluster
 # state has been successfully updated; use 'abort-if-fast-join-fails' instead.
@@ -3837,6 +3911,13 @@ The `memberlist` block configures the Gossip memberlist.
 # rejoin is not needed.
 # CLI flag: -memberlist.rejoin-interval
 [rejoin_interval: <duration> | default = 0s]
+
+# (experimental) Seed nodes to use for periodic rejoin. Takes precedence over
+# -memberlist.join for rejoining. If not specified, -memberlist.join is used.
+# Can be specified multiple times or as a comma-separated list. Supports IP,
+# hostname, or DNS Service Discovery format.
+# CLI flag: -memberlist.rejoin-seed-nodes
+[rejoin_seed_nodes: <list of strings> | default = ]
 
 # (advanced) How long to keep LEFT ingesters in the ring.
 # CLI flag: -memberlist.left-ingesters-timeout
@@ -3972,6 +4053,25 @@ zone_aware_routing:
   # bridge.
   # CLI flag: -memberlist.zone-aware-routing.role
   [role: <string> | default = "member"]
+
+propagation_delay_tracker:
+  # (experimental) Enable the propagation delay tracker to measure gossip
+  # propagation delay.
+  # CLI flag: -memberlist.propagation-delay-tracker.enabled
+  [enabled: <boolean> | default = false]
+
+  # (experimental) How often to publish beacons for propagation tracking.
+  # CLI flag: -memberlist.propagation-delay-tracker.beacon-interval
+  [beacon_interval: <duration> | default = 1m]
+
+  # (experimental) How long a beacon lives before being garbage collected.
+  # CLI flag: -memberlist.propagation-delay-tracker.beacon-lifetime
+  [beacon_lifetime: <duration> | default = 10m]
+
+  # (experimental) Log warning when beacon propagation delay exceeds this
+  # threshold. 0 disables logging.
+  # CLI flag: -memberlist.propagation-delay-tracker.log-beacons-latency-longer-than
+  [log_beacons_latency_longer_than: <duration> | default = 0s]
 ```
 
 ### limits
@@ -4157,6 +4257,16 @@ The `limits` block configures default and per-tenant limits imposed by component
 # CLI flag: -ingester.ignore-ooo-exemplars
 [ignore_ooo_exemplars: <boolean> | default = false]
 
+# (experimental) When the number of owned series for a tenant exceeds this
+# threshold, trigger early head compaction. 0 to disable.
+# CLI flag: -ingester.early-head-compaction-owned-series-threshold
+[early_head_compaction_owned_series_threshold: <int> | default = 0]
+
+# (experimental) Minimum estimated series reduction percentage (0-100) required
+# to trigger per-tenant early compaction.
+# CLI flag: -ingester.early-head-compaction-min-estimated-series-reduction-percentage
+[early_head_compaction_min_estimated_series_reduction_percentage: <int> | default = 15]
+
 # (experimental) Enable ingestion of native histogram samples. If false, native
 # histogram samples are ignored without an error. To query native histograms
 # with query-sharding enabled make sure to set
@@ -4190,6 +4300,12 @@ The `limits` block configures default and per-tenant limits imposed by component
 #       dev: '{namespace=~"dev-.*"}'
 #       prod: '{namespace=~"prod-.*"}'
 [active_series_additional_custom_trackers: <map of tracker name (string) to matcher (string)> | default = ]
+
+# (experimental) Maximum number of additional custom trackers for active series
+# that you can configure per tenant. This limit only applies to additional
+# custom trackers. Set to 0 to disable the limit.
+# CLI flag: -validation.max-active-series-additional-custom-trackers
+[max_active_series_additional_custom_trackers: <int> | default = 0]
 
 # Non-zero value enables out-of-order support for most recent samples that are
 # within the time window in relation to the TSDB's maximum time, i.e., within
@@ -4334,6 +4450,12 @@ The `limits` block configures default and per-tenant limits imposed by component
 # means all queries are sent to ingester.
 # CLI flag: -querier.query-ingesters-within
 [query_ingesters_within: <duration> | default = 13h]
+
+# (experimental) Enable the experimental Prometheus feature for delayed name
+# removal within MQE, which only works if remote execution and running sharding
+# within MQE is enabled.
+# CLI flag: -querier.enable-delayed-name-removal
+[enable_delayed_name_removal: <boolean> | default = false]
 
 # Limit the total query time range (end - start time). This limit is enforced in
 # the query-frontend on the received instant, range or remote read query.
@@ -4980,7 +5102,8 @@ The `ingest_storage` block configures the Kafka-based ingest storage.
 [enabled: <boolean> | default = false]
 
 kafka:
-  # The Kafka backend address.
+  # The Kafka seed broker address, or a comma-separated list of seed broker
+  # addresses.
   # CLI flag: -ingest-storage.kafka.address
   [address: <string> | default = ""]
 
@@ -5008,15 +5131,45 @@ kafka:
   # CLI flag: -ingest-storage.kafka.write-clients
   [write_clients: <int> | default = 1]
 
-  # The username used to authenticate to Kafka using the SASL plain mechanism.
-  # To enable SASL, configure both the username and password.
+  # The SASL mechanism used to authenticate to Kafka. Supported values: PLAIN,
+  # SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER. For backwards-compatibility,
+  # PLAIN with no username nor password disables SASL.
+  # CLI flag: -ingest-storage.kafka.sasl-mechanism
+  [sasl_mechanism: <string> | default = "PLAIN"]
+
+  # The username used to authenticate to Kafka using SASL. To enable SASL,
+  # configure both the username and password.
   # CLI flag: -ingest-storage.kafka.sasl-username
   [sasl_username: <string> | default = ""]
 
-  # The password used to authenticate to Kafka using the SASL plain mechanism.
-  # To enable SASL, configure both the username and password.
+  # The password used to authenticate to Kafka using SASL. To enable SASL,
+  # configure both the username and password.
   # CLI flag: -ingest-storage.kafka.sasl-password
   [sasl_password: <string> | default = ""]
+
+  # The OAuth token to use to authenticate to Kafka. Consider
+  # ingest-storage.kafka.sasl-oauthbearer-file-path instead.
+  # CLI flag: -ingest-storage.kafka.sasl-oauthbearer-token
+  [sasl_oauthbearer_token: <string> | default = ""]
+
+  # Optional authorization ID to use when authenticating to Kafka using SASL
+  # OAUTHBEARER.
+  # CLI flag: -ingest-storage.kafka.sasl-oauthbearer-zid
+  [sasl_oauthbearer_zid: <string> | default = ""]
+
+  # Optional additional OAuth extensions to include when authenticating to Kafka
+  # using SASL OAUTHBEARER as a JSON object.
+  # CLI flag: -ingest-storage.kafka.sasl-oauthbearer-extensions
+  [sasl_oauthbearer_extensions: <map of string to string> | default = {}]
+
+  # Path to a file containing an OAuth token to authenticate to Kafka. The file
+  # is read anew on every reauthentication, so it can be updated with fresh
+  # tokens. The file must be in JSON format, adhering to this JSON schema:
+  # {"type": "object", "required": ["token"], "properties": {"token": {"type":
+  # "string"}, "zid": {"type": "string"}, "extensions": {"type": "object",
+  # "additionalProperties": {"type": "string"}}}}
+  # CLI flag: -ingest-storage.kafka.sasl-oauthbearer-file-path
+  [sasl_oauthbearer_file_path: <string> | default = ""]
 
   # The consumer group used by the consumer to track the last consumed offset.
   # The consumer group must be different for each ingester. If the configured
@@ -5031,6 +5184,13 @@ kafka:
   # where it was left.
   # CLI flag: -ingest-storage.kafka.consumer-group-offset-commit-interval
   [consumer_group_offset_commit_interval: <duration> | default = 1s]
+
+  # (experimental) When true, the file-based offset stored in the TSDB directory
+  # is enforced at startup, taking precedence over Kafka consumer group offset.
+  # When false, offsets are still written to the file (in the TSDB directory)
+  # but the Kafka consumer group offset is used at startup.
+  # CLI flag: -ingest-storage.kafka.consumer-group-offset-commit-file-enforced
+  [consumer_group_offset_commit_file_enforced: <boolean> | default = false]
 
   # How frequently to poll the last produced offset, used to enforce strong read
   # consistency.
@@ -5464,6 +5624,19 @@ bucket_store:
     # loading.
     # CLI flag: -blocks-storage.bucket-store.index-header.verify-on-load
     [verify_on_load: <boolean> | default = false]
+
+    bucket_reader:
+      # (experimental) Enable reading TSDB index-header sections from object
+      # storage. When enabled, the configured
+      # -blocks-storage.bucket-store.index-header.bucket-reader.index-sections
+      # are not downloaded to local disk.
+      # CLI flag: -blocks-storage.bucket-store.index-header.bucket-reader.enabled
+      [enabled: <boolean> | default = false]
+
+      # (experimental) Index sections to read from object storage instead of
+      # local disk. Valid sections: all
+      # CLI flag: -blocks-storage.bucket-store.index-header.bucket-reader.index-sections
+      [index_sections: <string> | default = "all"]
 
   # (advanced) This option controls how many series to fetch per batch. The
   # batch size must be greater than 0.
@@ -5950,13 +6123,6 @@ sharding_ring:
 # smallest-range-oldest-blocks-first, newest-blocks-first.
 # CLI flag: -compactor.compaction-jobs-order
 [compaction_jobs_order: <string> | default = "smallest-range-oldest-blocks-first"]
-
-# (experimental) If enabled, the compactor constructs and uploads sparse index
-# headers to object storage during each compaction cycle. This allows
-# store-gateway instances to use the sparse headers from object storage instead
-# of recreating them locally.
-# CLI flag: -compactor.upload-sparse-index-headers
-[upload_sparse_index_headers: <boolean> | default = true]
 ```
 
 ### store_gateway
@@ -6053,6 +6219,13 @@ sharding_ring:
   # CLI flag: -store-gateway.sharding-ring.zone-awareness-enabled
   [zone_awareness_enabled: <boolean> | default = false]
 
+  # (advanced) Comma-separated list of zones to exclude from the ring. Instances
+  # in excluded zones will be filtered out from the ring. This option needs be
+  # set both on the store-gateway, querier and ruler when running in
+  # microservices mode.
+  # CLI flag: -store-gateway.sharding-ring.excluded-zones
+  [excluded_zones: <string> | default = ""]
+
   # (advanced) Minimum time to wait for ring stability at startup, if set to
   # positive value.
   # CLI flag: -store-gateway.sharding-ring.wait-stability-min-duration
@@ -6135,6 +6308,7 @@ The `memcached` block configures the Memcached-based caching backend. The suppor
 - `blocks-storage.bucket-store.chunks-cache`
 - `blocks-storage.bucket-store.index-cache`
 - `blocks-storage.bucket-store.metadata-cache`
+- `querier.mimir-query-engine.range-vector-splitting`
 - `query-frontend.results-cache`
 - `ruler-storage.cache`
 
@@ -6255,10 +6429,6 @@ The `memcached` block configures the Memcached-based caching backend. The suppor
 # VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13
 # CLI flag: -<prefix>.memcached.tls-min-version
 [tls_min_version: <string> | default = ""]
-
-# (experimental) Allow client creation even if initial DNS resolution fails.
-# CLI flag: -<prefix>.memcached.dns-ignore-startup-failures
-[dns_ignore_startup_failures: <boolean> | default = true]
 ```
 
 ### s3_storage_backend

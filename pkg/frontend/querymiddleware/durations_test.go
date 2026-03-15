@@ -11,11 +11,9 @@ import (
 	"github.com/go-kit/log"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/require"
-)
 
-func init() {
-	parser.ExperimentalDurationExpr = true
-}
+	"github.com/grafana/mimir/pkg/util/promqlext"
+)
 
 func TestDurationMiddleware(t *testing.T) {
 	testCases := map[string]struct {
@@ -48,12 +46,18 @@ func TestDurationMiddleware(t *testing.T) {
 			expectInstant: "rate(http_requests_total[5m])",
 			expectRange:   "rate(http_requests_total[6m])",
 		},
+		"valid duration expression with range() should be rewritten": {
+			query:         "rate(http_requests_total[range() + 30s])",
+			expectInstant: "rate(http_requests_total[30s])",
+			expectRange:   "rate(http_requests_total[31s])",
+		},
 	}
+
 	for name, tc := range testCases {
 		for _, instant := range []bool{false, true} {
 			t.Run(fmt.Sprintf("name=%s instant=%v", name, instant), func(t *testing.T) {
 				var req MetricsQueryRequest
-				expr, err := parser.ParseExpr(tc.query)
+				expr, err := promqlext.NewPromQLParser().ParseExpr(tc.query)
 				require.NoError(t, err)
 				if instant {
 					req = NewPrometheusInstantQueryRequest(
@@ -72,7 +76,7 @@ func TestDurationMiddleware(t *testing.T) {
 						nil,
 						2000,
 						3000,
-						60,
+						60000,
 						0,
 						expr,
 						Options{},

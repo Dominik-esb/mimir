@@ -44,12 +44,13 @@ func TestDistributor_QueryExemplars(t *testing.T) {
 	}
 
 	tests := map[string]struct {
-		shuffleShardSize  int
-		multiMatchers     [][]*labels.Matcher
-		maxSeriesPerQuery int
-		expectedResult    []mimirpb.TimeSeries
-		expectedIngesters int
-		expectedErr       error
+		shuffleShardSize        int
+		shuffleShardingDisabled bool
+		multiMatchers           [][]*labels.Matcher
+		maxSeriesPerQuery       int
+		expectedResult          []mimirpb.TimeSeries
+		expectedIngesters       int
+		expectedErr             error
 	}{
 		"should return an empty response if no series match": {
 			multiMatchers: [][]*labels.Matcher{
@@ -88,6 +89,18 @@ func TestDistributor_QueryExemplars(t *testing.T) {
 			shuffleShardSize:  3,
 			expectedIngesters: 3,
 		},
+		"should query all ingesters when shuffle sharding is disabled": {
+			multiMatchers: [][]*labels.Matcher{
+				{mustNewMatcher(labels.MatchEqual, model.MetricNameLabel, "series_1")},
+			},
+			expectedResult: []mimirpb.TimeSeries{
+				{Labels: fixtures[0].Labels, Exemplars: fixtures[0].Exemplars},
+				{Labels: fixtures[1].Labels, Exemplars: fixtures[1].Exemplars},
+			},
+			shuffleShardSize:        3,
+			shuffleShardingDisabled: true,
+			expectedIngesters:       numIngesters,
+		},
 	}
 
 	for testName, testData := range tests {
@@ -107,6 +120,12 @@ func TestDistributor_QueryExemplars(t *testing.T) {
 
 					// Enable exemplars ingestion.
 					testConfig.limits.MaxGlobalExemplarsPerUser = 1000
+
+					testConfig.configure = func(config *Config) {
+						if testData.shuffleShardingDisabled {
+							config.ShuffleShardingEnabled = false
+						}
+					}
 
 					if ingestStorageEnabled {
 						testConfig.ingestStorageEnabled = true
@@ -198,6 +217,9 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunksPerQueryLimitIsReac
 						},
 					})
 
+					dedupMetrics := limiter.NewSeriesDeduplicatorMetrics(reg[0])
+					userCtx = limiter.ContextWithNewSeriesLabelsDeduplicator(userCtx, dedupMetrics)
+
 					// Push a number of series below the max chunks limit. Each series has 1 sample,
 					// so expect 1 chunk per series when querying back.
 					initialSeries := limit / 3
@@ -215,7 +237,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunksPerQueryLimitIsReac
 
 					// Since the number of series (and thus chunks) is equal to the limit (but doesn't
 					// exceed it), we expect a query running on all series to succeed.
-					queryRes, err := ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+					queryRes, err := ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 					require.NoError(t, err)
 
 					require.Len(t, queryRes.StreamingSeries, initialSeries)
@@ -243,7 +265,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunksPerQueryLimitIsReac
 
 					// Since the number of series (and thus chunks) is exceeding to the limit, we expect
 					// a query running on all series to fail.
-					_, err = ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+					_, err = ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 					require.Error(t, err)
 					require.ErrorContains(t, err, testCase.expectedError)
 
@@ -277,6 +299,9 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxSeriesPerQueryLimitIsReac
 				},
 			})
 
+			metrics := limiter.NewSeriesDeduplicatorMetrics(reg[0])
+			userCtx = limiter.ContextWithNewSeriesLabelsDeduplicator(userCtx, metrics)
+
 			// Push a number of series below the max series limit.
 			initialSeries := maxSeriesLimit
 			writeReq := makeWriteRequest(0, initialSeries, 0, false, true, "foo")
@@ -294,7 +319,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxSeriesPerQueryLimitIsReac
 			// exceed it), we expect a query running on all series to succeed.
 			queryCtx := limiter.AddQueryLimiterToContext(userCtx, limiter.NewQueryLimiter(maxSeriesLimit, 0, 0, 0, stats.NewQueryMetrics(prometheus.NewPedanticRegistry())))
 			queryCtx = limiter.ContextWithNewUnlimitedMemoryConsumptionTracker(queryCtx)
-			queryRes, err := ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+			queryRes, err := ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 			require.NoError(t, err)
 
 			assert.Len(t, queryRes.StreamingSeries, initialSeries)
@@ -317,7 +342,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxSeriesPerQueryLimitIsReac
 
 			// Since the number of series is exceeding the limit, we expect
 			// a query running on all series to fail.
-			_, err = ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+			_, err = ds[0].QueryStream(queryCtx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 			require.Error(t, err)
 			assert.ErrorContains(t, err, "the query exceeded the maximum number of series")
 
@@ -346,6 +371,8 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunkBytesPerQueryLimitIs
 		limits:            limits,
 		replicationFactor: 1,
 	})
+	metrics := limiter.NewSeriesDeduplicatorMetrics(reg[0])
+	ctx = limiter.ContextWithNewSeriesLabelsDeduplicator(ctx, metrics)
 
 	allSeriesMatchers := []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchRegexp, model.MetricNameLabel, ".+"),
@@ -357,7 +384,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunkBytesPerQueryLimitIs
 	assert.Nil(t, err)
 
 	queryMetrics := stats.NewQueryMetrics(reg[0])
-	chunkSizeResponse, err := ds[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+	chunkSizeResponse, err := ds[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 	require.NoError(t, err)
 
 	_, responseChunkSize, err := countStreamingChunksAndBytes(chunkSizeResponse)
@@ -377,7 +404,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunkBytesPerQueryLimitIs
 
 	// Since the number of chunk bytes is equal to the limit (but doesn't
 	// exceed it), we expect a query running on all series to succeed.
-	queryRes, err := ds[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+	queryRes, err := ds[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 	require.NoError(t, err)
 	assert.Len(t, queryRes.StreamingSeries, seriesToAdd)
 
@@ -391,7 +418,7 @@ func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunkBytesPerQueryLimitIs
 	// Since the aggregated chunk size is exceeding the limit, we expect
 	// a query running on all series to fail but only when the chunks are
 	// actually consumed from the stream.
-	finalResp, err := ds[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+	finalResp, err := ds[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, allSeriesMatchers...)
 	require.NoError(t, err)
 
 	_, _, err = countStreamingChunksAndBytes(finalResp)
@@ -446,6 +473,8 @@ func TestDistributor_QueryStream_ShouldSuccessfullyRunOnSlowIngesterWithStreamin
 			// Ensure strong read consistency, required to have no flaky tests when ingest storage is enabled.
 			ctx := user.InjectOrgID(context.Background(), "test")
 			ctx = limiter.ContextWithNewUnlimitedMemoryConsumptionTracker(ctx)
+			metrics := limiter.NewSeriesDeduplicatorMetrics(reg[0])
+			ctx = limiter.ContextWithNewSeriesLabelsDeduplicator(ctx, metrics)
 			ctx = api.ContextWithReadConsistencyLevel(ctx, api.ReadConsistencyStrong)
 
 			// Push series.
@@ -462,7 +491,7 @@ func TestDistributor_QueryStream_ShouldSuccessfullyRunOnSlowIngesterWithStreamin
 				t.Run(fmt.Sprintf("Query #%d", i), func(t *testing.T) {
 					t.Parallel()
 
-					res, err := distributors[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, matchers)
+					res, err := distributors[0].QueryStream(ctx, queryMetrics, math.MinInt32, math.MaxInt32, false, nil, matchers)
 					require.NoError(t, err)
 					require.Equal(t, numSeries, len(res.StreamingSeries))
 

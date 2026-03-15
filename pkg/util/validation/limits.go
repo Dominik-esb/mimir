@@ -21,58 +21,60 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/otlptranslator"
 	"github.com/prometheus/prometheus/model/relabel"
-	"github.com/prometheus/prometheus/promql/parser"
 	"go.uber.org/atomic"
+	"go.yaml.in/yaml/v3"
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/time/rate"
-	"gopkg.in/yaml.v3"
 
 	"github.com/grafana/mimir/pkg/costattribution/costattributionmodel"
 	asmodel "github.com/grafana/mimir/pkg/ingester/activeseries/model"
 	"github.com/grafana/mimir/pkg/querier/api"
 	"github.com/grafana/mimir/pkg/ruler/notifier"
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
+	"github.com/grafana/mimir/pkg/util/promqlext"
 )
 
 const (
-	MaxSeriesPerMetricFlag                    = "ingester.max-global-series-per-metric"
-	MaxMetadataPerMetricFlag                  = "ingester.max-global-metadata-per-metric"
-	MaxSeriesPerUserFlag                      = "ingester.max-global-series-per-user"
-	MaxMetadataPerUserFlag                    = "ingester.max-global-metadata-per-user"
-	MaxChunksPerQueryFlag                     = "querier.max-fetched-chunks-per-query"
-	MaxChunkBytesPerQueryFlag                 = "querier.max-fetched-chunk-bytes-per-query"
-	MaxSeriesPerQueryFlag                     = "querier.max-fetched-series-per-query"
-	MaxEstimatedChunksPerQueryMultiplierFlag  = "querier.max-estimated-fetched-chunks-per-query-multiplier"
-	MaxEstimatedMemoryConsumptionPerQueryFlag = "querier.max-estimated-memory-consumption-per-query"
-	MaxLabelNamesPerSeriesFlag                = "validation.max-label-names-per-series"
-	MaxLabelNamesPerInfoSeriesFlag            = "validation.max-label-names-per-info-series"
-	MaxLabelNameLengthFlag                    = "validation.max-length-label-name"
-	MaxLabelValueLengthFlag                   = "validation.max-length-label-value"
-	LabelValueLengthOverLimitStrategyFlag     = "validation.label-value-length-over-limit-strategy"
-	MaxMetadataLengthFlag                     = "validation.max-metadata-length"
-	maxNativeHistogramBucketsFlag             = "validation.max-native-histogram-buckets"
-	ReduceNativeHistogramOverMaxBucketsFlag   = "validation.reduce-native-histogram-over-max-buckets"
-	CreationGracePeriodFlag                   = "validation.create-grace-period"
-	PastGracePeriodFlag                       = "validation.past-grace-period"
-	MaxPartialQueryLengthFlag                 = "querier.max-partial-query-length"
-	MaxSeriesQueryLimitFlag                   = "querier.max-series-query-limit"
-	MaxLabelNamesLimitFlag                    = "querier.max-label-names-limit"
-	MaxLabelValuesLimitFlag                   = "querier.max-label-values-limit"
-	MaxTotalQueryLengthFlag                   = "query-frontend.max-total-query-length"
-	MaxQueryExpressionSizeBytesFlag           = "query-frontend.max-query-expression-size-bytes"
-	MaxActiveSeriesPerUserFlag                = "distributor.max-active-series-per-user"
-	RequestRateFlag                           = "distributor.request-rate-limit"
-	RequestBurstSizeFlag                      = "distributor.request-burst-size"
-	IngestionRateFlag                         = "distributor.ingestion-rate-limit"
-	IngestionBurstSizeFlag                    = "distributor.ingestion-burst-size"
-	IngestionBurstFactorFlag                  = "distributor.ingestion-burst-factor"
-	HATrackerMaxClustersFlag                  = "distributor.ha-tracker.max-clusters"
-	resultsCacheTTLFlag                       = "query-frontend.results-cache-ttl"
-	resultsCacheTTLForOutOfOrderWindowFlag    = "query-frontend.results-cache-ttl-for-out-of-order-time-window"
-	alignQueriesWithStepFlag                  = "query-frontend.align-queries-with-step"
-	QueryIngestersWithinFlag                  = "querier.query-ingesters-within"
-	AlertmanagerMaxGrafanaConfigSizeFlag      = "alertmanager.max-grafana-config-size-bytes"
-	AlertmanagerMaxGrafanaStateSizeFlag       = "alertmanager.max-grafana-state-size-bytes"
+	MaxSeriesPerMetricFlag                      = "ingester.max-global-series-per-metric"
+	MaxMetadataPerMetricFlag                    = "ingester.max-global-metadata-per-metric"
+	MaxSeriesPerUserFlag                        = "ingester.max-global-series-per-user"
+	MaxMetadataPerUserFlag                      = "ingester.max-global-metadata-per-user"
+	MaxChunksPerQueryFlag                       = "querier.max-fetched-chunks-per-query"
+	MaxChunkBytesPerQueryFlag                   = "querier.max-fetched-chunk-bytes-per-query"
+	MaxSeriesPerQueryFlag                       = "querier.max-fetched-series-per-query"
+	MaxEstimatedChunksPerQueryMultiplierFlag    = "querier.max-estimated-fetched-chunks-per-query-multiplier"
+	MaxEstimatedMemoryConsumptionPerQueryFlag   = "querier.max-estimated-memory-consumption-per-query"
+	MaxLabelNamesPerSeriesFlag                  = "validation.max-label-names-per-series"
+	MaxLabelNamesPerInfoSeriesFlag              = "validation.max-label-names-per-info-series"
+	MaxLabelNameLengthFlag                      = "validation.max-length-label-name"
+	MaxLabelValueLengthFlag                     = "validation.max-length-label-value"
+	LabelValueLengthOverLimitStrategyFlag       = "validation.label-value-length-over-limit-strategy"
+	MaxMetadataLengthFlag                       = "validation.max-metadata-length"
+	maxNativeHistogramBucketsFlag               = "validation.max-native-histogram-buckets"
+	ReduceNativeHistogramOverMaxBucketsFlag     = "validation.reduce-native-histogram-over-max-buckets"
+	CreationGracePeriodFlag                     = "validation.create-grace-period"
+	PastGracePeriodFlag                         = "validation.past-grace-period"
+	MaxActiveSeriesAdditionalCustomTrackersFlag = "validation.max-active-series-additional-custom-trackers"
+	MaxPartialQueryLengthFlag                   = "querier.max-partial-query-length"
+	MaxSeriesQueryLimitFlag                     = "querier.max-series-query-limit"
+	MaxLabelNamesLimitFlag                      = "querier.max-label-names-limit"
+	MaxLabelValuesLimitFlag                     = "querier.max-label-values-limit"
+	MaxTotalQueryLengthFlag                     = "query-frontend.max-total-query-length"
+	MaxQueryExpressionSizeBytesFlag             = "query-frontend.max-query-expression-size-bytes"
+	MaxActiveSeriesPerUserFlag                  = "distributor.max-active-series-per-user"
+	RequestRateFlag                             = "distributor.request-rate-limit"
+	RequestBurstSizeFlag                        = "distributor.request-burst-size"
+	IngestionRateFlag                           = "distributor.ingestion-rate-limit"
+	IngestionBurstSizeFlag                      = "distributor.ingestion-burst-size"
+	IngestionBurstFactorFlag                    = "distributor.ingestion-burst-factor"
+	HATrackerMaxClustersFlag                    = "distributor.ha-tracker.max-clusters"
+	resultsCacheTTLFlag                         = "query-frontend.results-cache-ttl"
+	resultsCacheTTLForOutOfOrderWindowFlag      = "query-frontend.results-cache-ttl-for-out-of-order-time-window"
+	alignQueriesWithStepFlag                    = "query-frontend.align-queries-with-step"
+	QueryIngestersWithinFlag                    = "querier.query-ingesters-within"
+	EnableDelayedNameRemovalFlag                = "querier.enable-delayed-name-removal"
+	AlertmanagerMaxGrafanaConfigSizeFlag        = "alertmanager.max-grafana-config-size-bytes"
+	AlertmanagerMaxGrafanaStateSizeFlag         = "alertmanager.max-grafana-state-size-bytes"
 
 	// MinCompactorPartialBlockDeletionDelay is the minimum partial blocks deletion delay that can be configured in Mimir.
 	MinCompactorPartialBlockDeletionDelay = 4 * time.Hour
@@ -174,6 +176,9 @@ type Limits struct {
 	// Exemplars
 	MaxGlobalExemplarsPerUser int  `yaml:"max_global_exemplars_per_user" json:"max_global_exemplars_per_user" category:"experimental"`
 	IgnoreOOOExemplars        bool `yaml:"ignore_ooo_exemplars" json:"ignore_ooo_exemplars" category:"experimental"`
+	// Per-tenant early head compaction
+	EarlyHeadCompactionOwnedSeriesThreshold                  int `yaml:"early_head_compaction_owned_series_threshold" json:"early_head_compaction_owned_series_threshold" category:"experimental"`
+	EarlyHeadCompactionMinEstimatedSeriesReductionPercentage int `yaml:"early_head_compaction_min_estimated_series_reduction_percentage" json:"early_head_compaction_min_estimated_series_reduction_percentage" category:"experimental"`
 	// Native histograms
 	NativeHistogramsIngestionEnabled bool `yaml:"native_histograms_ingestion_enabled" json:"native_histograms_ingestion_enabled" category:"experimental"`
 
@@ -181,6 +186,7 @@ type Limits struct {
 	ActiveSeriesBaseCustomTrackersConfig       asmodel.CustomTrackersConfig                  `yaml:"active_series_custom_trackers" json:"active_series_custom_trackers" doc:"description=Custom trackers for active metrics. If there are active series matching a provided matcher (map value), the count is exposed in the custom trackers metric labeled using the tracker name (map key). Zero-valued counts are not exposed and are removed when they go back to zero." category:"advanced"`
 	ActiveSeriesAdditionalCustomTrackersConfig asmodel.CustomTrackersConfig                  `yaml:"active_series_additional_custom_trackers" json:"active_series_additional_custom_trackers" doc:"description=Additional custom trackers for active metrics merged on top of the base custom trackers. You can use this configuration option to define the base custom trackers globally for all tenants, and then use the additional trackers to add extra trackers on a per-tenant basis." category:"advanced"`
 	activeSeriesMergedCustomTrackersConfig     *atomic.Pointer[asmodel.CustomTrackersConfig] `yaml:"-" json:"-"`
+	MaxActiveSeriesAdditionalCustomTrackers    int                                           `yaml:"max_active_series_additional_custom_trackers" json:"max_active_series_additional_custom_trackers" category:"experimental"`
 
 	// Max allowed time window for out-of-order samples.
 	OutOfOrderTimeWindow                 model.Duration `yaml:"out_of_order_time_window" json:"out_of_order_time_window"`
@@ -208,6 +214,7 @@ type Limits struct {
 	QueryShardingMaxShardedQueries        int            `yaml:"query_sharding_max_sharded_queries" json:"query_sharding_max_sharded_queries"`
 	QueryShardingMaxRegexpSizeBytes       int            `yaml:"query_sharding_max_regexp_size_bytes" json:"query_sharding_max_regexp_size_bytes"`
 	QueryIngestersWithin                  model.Duration `yaml:"query_ingesters_within" json:"query_ingesters_within" category:"advanced"`
+	EnableDelayedNameRemoval              bool           `yaml:"enable_delayed_name_removal" json:"enable_delayed_name_removal" category:"experimental"`
 
 	// Query-frontend limits.
 	MaxTotalQueryLength                    model.Duration         `yaml:"max_total_query_length" json:"max_total_query_length"`
@@ -386,11 +393,14 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.OutOfOrderTimeWindow, "ingester.out-of-order-time-window", fmt.Sprintf("Non-zero value enables out-of-order support for most recent samples that are within the time window in relation to the TSDB's maximum time, i.e., within [db.maxTime-timeWindow, db.maxTime]). The ingester will need more memory as a factor of rate of out-of-order samples being ingested and the number of series that are getting out-of-order samples. If query falls into this window, cached results will use value from -%s option to specify TTL for resulting cache entry.", resultsCacheTTLForOutOfOrderWindowFlag))
 	f.BoolVar(&l.NativeHistogramsIngestionEnabled, "ingester.native-histograms-ingestion-enabled", true, "Enable ingestion of native histogram samples. If false, native histogram samples are ignored without an error. To query native histograms with query-sharding enabled make sure to set -query-frontend.query-result-response-format to 'protobuf'.")
 	f.BoolVar(&l.OutOfOrderBlocksExternalLabelEnabled, "ingester.out-of-order-blocks-external-label-enabled", false, "Whether the shipper should label out-of-order blocks with an external label before uploading them. Setting this label will compact out-of-order blocks separately from non-out-of-order blocks")
+	f.IntVar(&l.EarlyHeadCompactionOwnedSeriesThreshold, "ingester.early-head-compaction-owned-series-threshold", 0, "When the number of owned series for a tenant exceeds this threshold, trigger early head compaction. 0 to disable.")
+	f.IntVar(&l.EarlyHeadCompactionMinEstimatedSeriesReductionPercentage, "ingester.early-head-compaction-min-estimated-series-reduction-percentage", 15, "Minimum estimated series reduction percentage (0-100) required to trigger per-tenant early compaction.")
 
 	f.StringVar(&l.SeparateMetricsGroupLabel, "validation.separate-metrics-group-label", "", "Label used to define the group label for metrics separation. For each write request, the group is obtained from the first non-empty group label from the first timeseries in the incoming list of timeseries. Specific distributor and ingester metrics will be further separated adding a 'group' label with group label's value. Currently applies to the following metrics: cortex_discarded_samples_total")
 
 	f.IntVar(&l.MaxCostAttributionCardinality, "validation.max-cost-attribution-cardinality", 2000, "Maximum cardinality of cost attribution labels allowed per user.")
 	f.Var(&l.CostAttributionCooldown, "validation.cost-attribution-cooldown", "Defines how long cost attribution stays in overflow before attempting a reset, with received/discarded samples extending the cooldown if overflow persists, while active series reset and restart tracking after the cooldown.")
+	f.IntVar(&l.MaxActiveSeriesAdditionalCustomTrackers, MaxActiveSeriesAdditionalCustomTrackersFlag, 0, "Maximum number of additional custom trackers for active series that you can configure per tenant. This limit only applies to additional custom trackers. Set to 0 to disable the limit.")
 
 	f.IntVar(&l.MaxChunksPerQuery, MaxChunksPerQueryFlag, 2e6, "Maximum number of chunks that can be fetched in a single query from ingesters and store-gateways. This limit is enforced in the querier, ruler and store-gateway. 0 to disable.")
 	f.Float64Var(&l.MaxEstimatedChunksPerQueryMultiplier, MaxEstimatedChunksPerQueryMultiplierFlag, 0, "Maximum number of chunks estimated to be fetched in a single query from ingesters and store-gateways, as a multiple of -"+MaxChunksPerQueryFlag+". This limit is enforced in the querier. Must be greater than or equal to 1, or 0 to disable.")
@@ -421,6 +431,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&l.QueryShardingMaxRegexpSizeBytes, "query-frontend.query-sharding-max-regexp-size-bytes", 4096, "Disable query sharding for any query containing a regular expression matcher longer than the configured number of bytes. 0 to disable the limit.")
 	_ = l.QueryIngestersWithin.Set("13h")
 	f.Var(&l.QueryIngestersWithin, QueryIngestersWithinFlag, "Maximum lookback beyond which queries are not sent to ingester. 0 means all queries are sent to ingester.")
+	f.BoolVar(&l.EnableDelayedNameRemoval, EnableDelayedNameRemovalFlag, false, "Enable the experimental Prometheus feature for delayed name removal within MQE, which only works if remote execution and running sharding within MQE is enabled.")
 
 	_ = l.RulerEvaluationDelay.Set("1m")
 	f.Var(&l.RulerEvaluationDelay, "ruler.evaluation-delay-duration", "Duration to delay the evaluation of rules to ensure the underlying metrics have been pushed.")
@@ -682,6 +693,15 @@ func (l *Limits) Validate() error {
 		return err
 	}
 
+	if l.EarlyHeadCompactionMinEstimatedSeriesReductionPercentage < 0 || l.EarlyHeadCompactionMinEstimatedSeriesReductionPercentage > 100 {
+		return fmt.Errorf("early_head_compaction_min_estimated_series_reduction_percentage must be between 0 and 100")
+	}
+
+	// Validate additional custom tracker config doesn't exceed the limit.
+	if err := l.ActiveSeriesAdditionalCustomTrackersConfig.Validate(l.MaxActiveSeriesAdditionalCustomTrackers); err != nil {
+		return fmt.Errorf("active_series_additional_custom_trackers validation failed: %w", err)
+	}
+
 	return nil
 }
 
@@ -691,6 +711,8 @@ func (l *Limits) Validate() error {
 const LabelValueHashLen = len("(hash:)") + blake2b.Size256*2
 
 func (l *Limits) canonicalizeQueries() {
+	parser := promqlext.NewPromQLParser()
+
 	for i, q := range l.BlockedQueries {
 		if q.Regex {
 			continue
@@ -866,9 +888,22 @@ func (o *Overrides) PastGracePeriod(userID string) time.Duration {
 	return time.Duration(o.getOverridesForUser(userID).PastGracePeriod)
 }
 
-// MaxActiveSeriesPerUser returns the maximum number of active series a user is allowed to store across the cluster.
-func (o *Overrides) MaxActiveSeriesPerUser(userID string) int {
-	return o.getOverridesForUser(userID).MaxActiveSeriesPerUser
+// MaxActiveOrGlobalSeriesPerUser returns the maximum number of active series a user is allowed to store across the cluster.
+// It will automatically fall back to the MaxGlobalSeriesPerUser setting if MaxActiveSeriesPerUser is unset.
+// This means that for users who have any overrides defined, the fallback order is:
+// - Tenant's MaxActiveSeriesPerUser
+// - Default MaxActiveSeriesPerUser
+// - Tenant's MaxGlobalSeriesPerUser
+// - Default MaxGlobalSeriesPerUser
+// And for tenants without overrides it's just:
+// - Default MaxActiveSeriesPerUser
+// - Default MaxGlobalSeriesPerUser
+func (o *Overrides) MaxActiveOrGlobalSeriesPerUser(userID string) int {
+	overrides := o.getOverridesForUser(userID)
+	if maxActive := overrides.MaxActiveSeriesPerUser; maxActive > 0 {
+		return maxActive
+	}
+	return overrides.MaxGlobalSeriesPerUser
 }
 
 // MaxGlobalSeriesPerUser returns the maximum number of series a user is allowed to store across the cluster.
@@ -879,6 +914,16 @@ func (o *Overrides) MaxGlobalSeriesPerUser(userID string) int {
 // MaxGlobalSeriesPerMetric returns the maximum number of series allowed per metric across the cluster.
 func (o *Overrides) MaxGlobalSeriesPerMetric(userID string) int {
 	return o.getOverridesForUser(userID).MaxGlobalSeriesPerMetric
+}
+
+// EarlyHeadCompactionOwnedSeriesThreshold returns the per-tenant early compaction owned series threshold.
+func (o *Overrides) EarlyHeadCompactionOwnedSeriesThreshold(userID string) int {
+	return o.getOverridesForUser(userID).EarlyHeadCompactionOwnedSeriesThreshold
+}
+
+// EarlyHeadCompactionMinEstimatedSeriesReductionPercentage returns the minimum estimated reduction percentage for per-tenant early compaction.
+func (o *Overrides) EarlyHeadCompactionMinEstimatedSeriesReductionPercentage(userID string) int {
+	return o.getOverridesForUser(userID).EarlyHeadCompactionMinEstimatedSeriesReductionPercentage
 }
 
 func (o *Overrides) MaxChunksPerQuery(userID string) int {
@@ -1002,6 +1047,16 @@ func (o *Overrides) QueryShardingMaxRegexpSizeBytes(userID string) int {
 // 0 means all queries are sent to ingester.
 func (o *Overrides) QueryIngestersWithin(userID string) time.Duration {
 	return time.Duration(o.getOverridesForUser(userID).QueryIngestersWithin)
+}
+
+// EnableDelayedNameRemoval returns whether delayed name removal is enabled for this user.
+// If enabled, this delays the removal of the __name__ label to the last step of the query evaluation.
+// This is useful in certain scenarios where the __name__ label must be preserved or where applying a
+// regex-matcher to the __name__ label may otherwise lead to duplicate labelset errors.
+// This only applies for MQE. The Prometheus engine feature is not controlled per tenant, and we
+// currently do not expose a flag to set it globally.
+func (o *Overrides) EnableDelayedNameRemoval(userID string) bool {
+	return o.getOverridesForUser(userID).EnableDelayedNameRemoval
 }
 
 // EnforceMetadataMetricName whether to enforce the presence of a metric name on metadata.

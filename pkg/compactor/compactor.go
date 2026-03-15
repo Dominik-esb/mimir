@@ -27,6 +27,7 @@ import (
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/timeutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/thanos-io/objstore"
@@ -128,8 +129,8 @@ type Config struct {
 	BlocksGrouperFactory   BlocksGrouperFactory   `yaml:"-"`
 	BlocksCompactorFactory BlocksCompactorFactory `yaml:"-"`
 
-	// Allow compactor to upload sparse-index-header files
-	UploadSparseIndexHeaders       bool               `yaml:"upload_sparse_index_headers" category:"experimental"`
+	// Configuration for the compactor to upload sparse-index-header files set based
+	// on store-gateway/bucket store index-header configuration.
 	SparseIndexHeadersSamplingRate int                `yaml:"-"`
 	SparseIndexHeadersConfig       indexheader.Config `yaml:"-"`
 }
@@ -159,7 +160,6 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
 		"If not 0, blocks will be marked for deletion and the compactor component will permanently delete blocks marked for deletion from the bucket. "+
 		"If 0, blocks will be deleted straight away. Note that deleting blocks immediately can cause query failures.")
 	f.DurationVar(&cfg.TenantCleanupDelay, "compactor.tenant-cleanup-delay", 6*time.Hour, "For tenants marked for deletion, this is the time between deletion of the last block, and doing final cleanup (marker files, debug files) of the tenant.")
-	f.BoolVar(&cfg.UploadSparseIndexHeaders, "compactor.upload-sparse-index-headers", true, "If enabled, the compactor constructs and uploads sparse index headers to object storage during each compaction cycle. This allows store-gateway instances to use the sparse headers from object storage instead of recreating them locally.")
 
 	// compactor concurrency options
 	f.IntVar(&cfg.MaxOpeningBlocksConcurrency, "compactor.max-opening-blocks-concurrency", 1, "Number of goroutines opening blocks before compaction.")
@@ -592,12 +592,16 @@ func (c *MultitenantCompactor) running(ctx context.Context) error {
 	// Run an initial compaction before starting the interval.
 	c.compactUsers(ctx)
 
-	ticker := time.NewTicker(util.DurationWithJitter(c.compactorCfg.CompactionInterval, 0.05))
-	defer ticker.Stop()
+	// Apply 0-100% jitter to the first tick to spread compactions when multiple
+	// compactors start at the same time and the initial run completes quickly.
+	firstInterval := util.DurationWithNegativeJitter(c.compactorCfg.CompactionInterval, 1.0) + 1
+	standardInterval := util.DurationWithJitter(c.compactorCfg.CompactionInterval, 0.05)
+	stopTicker, tickerChan := timeutil.NewVariableTicker(firstInterval, standardInterval)
+	defer stopTicker()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tickerChan:
 			c.compactUsers(ctx)
 		case <-ctx.Done():
 			return nil
@@ -815,7 +819,6 @@ func (c *MultitenantCompactor) compactUser(ctx context.Context, userID string) e
 		c.compactorCfg.CompactionSkipFutureMaxTime,
 		c.compactorCfg.BlockSyncConcurrency,
 		c.bucketCompactorMetrics,
-		c.compactorCfg.UploadSparseIndexHeaders,
 		c.compactorCfg.SparseIndexHeadersSamplingRate,
 		c.compactorCfg.SparseIndexHeadersConfig,
 		c.cfgProvider.CompactorMaxPerBlockUploadConcurrency(userID),
