@@ -146,7 +146,9 @@ ruler_storage:
   azure:
     container_name: mimir-ruler
 ```
+#### Azure Managed Identity
 
+ToDo
 #### Azure Workload Identity
 
 Here is an example configuration for using Azure Workload Identity.
